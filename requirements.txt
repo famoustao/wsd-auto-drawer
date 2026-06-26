@@ -1,0 +1,2 @@
+# WSD Auto Drawer
+# 纯 Python 实现，无外部依赖
