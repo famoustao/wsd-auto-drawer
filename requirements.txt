@@ -1,2 +1,5 @@
 # WSD Auto Drawer
-# 纯 Python 实现，无外部依赖
+# 核心功能纯 Python 实现，无外部依赖
+
+# Web UI 可选依赖
+flask>=2.0.0

@@ -30,6 +30,8 @@ setup(
     entry_points={
         "console_scripts": [
             "wsd-drawer=main:main",
+            "wsd-gui=gui:main",
+            "wsd-web=web_ui:main",
         ],
     },
 )

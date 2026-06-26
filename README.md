@@ -34,7 +34,34 @@ pip install -e .
 
 ## 使用方法
 
-### 命令行
+### 1. 桌面 GUI (推荐)
+
+```bash
+python gui.py
+```
+
+功能：
+- 可视化文件选择（输入/输出目录）
+- 转换模式切换（SVG → WSD / WSD → SVG）
+- 实时日志显示
+- 进度条动画
+- 转换完成后自动打开文件夹
+
+### 2. Web 界面
+
+```bash
+pip install flask
+python web_ui.py
+```
+
+然后访问 http://127.0.0.1:5000
+
+功能：
+- 浏览器内拖拽上传
+- 一键下载转换结果
+- 响应式设计，支持移动端
+
+### 3. 命令行
 
 ```bash
 # SVG 转 WSD
@@ -47,7 +74,7 @@ python main.py wsd2svg input.wsd output.svg
 python main.py batch ./svg_dir ./wsd_dir --mode svg2wsd
 ```
 
-### 作为模块使用
+### 4. 作为模块使用
 
 ```python
 from svg_to_wsd import svg_to_wsd
@@ -64,7 +91,9 @@ wsd_to_svg("input.wsd", "output.svg")
 
 ```
 wsd-auto-drawer/
-├── main.py              # 主程序入口
+├── main.py              # 命令行入口
+├── gui.py               # 桌面 GUI (tkinter)
+├── web_ui.py            # Web 界面 (Flask)
 ├── svg_to_wsd.py        # SVG 转 WSD 转换器
 ├── wsd_to_svg.py        # WSD 转 SVG 转换器
 ├── tests/
@@ -73,7 +102,7 @@ wsd-auto-drawer/
 │   └── workflows/
 │       └── ci.yml       # GitHub Actions 自动编译
 ├── setup.py             # Python 包配置
-├── requirements.txt     # 依赖（纯 Python，无外部依赖）
+├── requirements.txt     # 依赖
 └── README.md            # 本文件
 ```
 
