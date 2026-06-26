@@ -10,11 +10,12 @@
 
 namespace converter {
 
-void svgToWsd(const std::string& input, const std::string& output) {
+void svgToWsd(const std::string& templatePath, const std::string& svgInput, const std::string& wsdOutput) {
     svg::Parser parser;
-    auto objects = parser.parse(input);
+    auto objects = parser.parse(svgInput);
+
     wsd::Writer writer;
-    writer.write(output, objects);
+    writer.writeWithTemplate(templatePath, objects, wsdOutput);
 }
 
 void wsdToSvg(const std::string& input, const std::string& output) {
@@ -23,7 +24,6 @@ void wsdToSvg(const std::string& input, const std::string& output) {
 
     if (objects.empty()) return;
 
-    // 计算边界框
     int16_t minX = INT16_MAX, maxX = INT16_MIN;
     int16_t minY = INT16_MAX, maxY = INT16_MIN;
     for (const auto& obj : objects) {

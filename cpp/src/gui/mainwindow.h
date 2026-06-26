@@ -11,7 +11,8 @@ class ConverterWorker : public QThread {
     Q_OBJECT
 public:
     enum Mode { Svg2Wsd, Wsd2Svg };
-    ConverterWorker(Mode mode, const QStringList& inputs, const QString& outputDir, QObject* parent = nullptr);
+    ConverterWorker(Mode mode, const QStringList& inputs, const QString& outputDir,
+                     const QString& templatePath, QObject* parent = nullptr);
     void run() override;
     void stop() { m_stop = true; }
 
@@ -24,6 +25,7 @@ private:
     Mode m_mode;
     QStringList m_inputs;
     QString m_outputDir;
+    QString m_templatePath;
     std::atomic<bool> m_stop{false};
 };
 

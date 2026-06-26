@@ -8,8 +8,11 @@
 #include <QDir>
 #include <QFileInfo>
 
-ConverterWorker::ConverterWorker(Mode mode, const QStringList& inputs, const QString& outputDir, QObject* parent)
-    : QThread(parent), m_mode(mode), m_inputs(inputs), m_outputDir(outputDir) {}
+ConverterWorker::ConverterWorker(Mode mode, const QStringList& inputs,
+                                  const QString& outputDir, const QString& templatePath,
+                                  QObject* parent)
+    : QThread(parent), m_mode(mode), m_inputs(inputs),
+      m_outputDir(outputDir), m_templatePath(templatePath) {}
 
 void ConverterWorker::run() {
     int success = 0, failed = 0;
@@ -24,7 +27,9 @@ void ConverterWorker::run() {
 
         try {
             if (m_mode == Svg2Wsd) {
-                converter::svgToWsd(input.toStdString(), output.toStdString());
+                converter::svgToWsd(m_templatePath.toStdString(),
+                                    input.toStdString(),
+                                    output.toStdString());
             } else {
                 converter::wsdToSvg(input.toStdString(), output.toStdString());
             }
@@ -42,7 +47,7 @@ void ConverterWorker::run() {
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent), ui(new Ui::MainWindow) {
     ui->setupUi(this);
-    setWindowTitle("WSD Auto Drawer - C++");
+    setWindowTitle("WSD Auto Drawer - C++ (Template Mode)");
 
     connect(ui->btnBrowseInput, &QPushButton::clicked, this, &MainWindow::onBrowseInput);
     connect(ui->btnBrowseOutput, &QPushButton::clicked, this, &MainWindow::onBrowseOutput);
@@ -81,6 +86,22 @@ void MainWindow::onConvert() {
         QMessageBox::warning(this, "警告", "请选择输入文件或文件夹");
         return;
     }
+
+    // SVG -> WSD 模式需要模板文件
+    QString templatePath;
+    if (modeIdx == 0) {
+        templatePath = QFileDialog::getOpenFileName(
+            this, "选择 WSD 模板文件", QString(),
+            "WSD Files (*.wsd)");
+        if (templatePath.isEmpty()) {
+            QMessageBox::warning(this, "警告",
+                "SVG 转 WSD 需要一个模板文件。\n"
+                "请选择一个能被 EduEditor 正常打开的 .wsd 文件作为模板。\n\n"
+                "转换后的文件将保留模板的文档结构，仅替换矢量坐标数据。");
+            return;
+        }
+    }
+
     if (outputDir.isEmpty()) {
         outputDir = QDir(inputRaw).absolutePath();
         ui->editOutput->setText(outputDir);
@@ -110,7 +131,7 @@ void MainWindow::onConvert() {
     ui->textLog->clear();
 
     auto mode = (modeIdx == 0) ? ConverterWorker::Svg2Wsd : ConverterWorker::Wsd2Svg;
-    m_worker = new ConverterWorker(mode, inputs, outputDir, this);
+    m_worker = new ConverterWorker(mode, inputs, outputDir, templatePath, this);
     connect(m_worker, &ConverterWorker::log, this, &MainWindow::onLog);
     connect(m_worker, &ConverterWorker::progress, this, &MainWindow::onProgress);
     connect(m_worker, &ConverterWorker::finished, this, &MainWindow::onFinished);
