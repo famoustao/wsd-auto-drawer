@@ -25,7 +25,7 @@ struct Object {
 
 struct FileHeader {
     static constexpr const char* MAGIC = "WSTUDIO7";
-    static constexpr uint8_t VERSION = 7;
+    static constexpr uint8_t VERSION = 8;
 };
 
 // 对象头模板 (41字节)
