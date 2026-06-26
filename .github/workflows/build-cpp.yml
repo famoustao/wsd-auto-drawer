@@ -20,6 +20,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
     - name: Install Qt
       uses: jurplel/install-qt-action@v4
       with:
@@ -30,22 +35,28 @@ jobs:
         cache: true
 
     - name: Configure
-      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+      shell: pwsh
+      run: |
+        $env:CMAKE_PREFIX_PATH = "$env:Qt6_Dir"
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$env:Qt6_Dir"
 
     - name: Build
-      run: cmake --build build --config Release
+      shell: pwsh
+      run: |
+        $env:CMAKE_PREFIX_PATH = "$env:Qt6_Dir"
+        cmake --build build --config Release --verbose
 
     - name: Deploy Qt DLLs
       shell: pwsh
       run: |
         $exe = Get-ChildItem -Path build/Release -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
         if ($exe) {
-          windeployqt "$($exe.FullName)" --release
+          & "$env:Qt6_Dir\bin\windeployqt.exe" "$($exe.FullName)" --release
           Write-Host "Deployed: $($exe.FullName)"
         } else {
           $exe2 = Get-ChildItem -Path build -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
           if ($exe2) {
-            windeployqt "$($exe2.FullName)" --release
+            & "$env:Qt6_Dir\bin\windeployqt.exe" "$($exe2.FullName)" --release
             Write-Host "Deployed: $($exe2.FullName)"
           }
         }
