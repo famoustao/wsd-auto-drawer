@@ -20,11 +20,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
     - name: Install Qt
       uses: jurplel/install-qt-action@v4
       with:
@@ -37,14 +32,12 @@ jobs:
     - name: Configure
       shell: pwsh
       run: |
-        $env:CMAKE_PREFIX_PATH = "$env:Qt6_Dir"
         cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$env:Qt6_Dir"
 
     - name: Build
       shell: pwsh
       run: |
-        $env:CMAKE_PREFIX_PATH = "$env:Qt6_Dir"
-        cmake --build build --config Release --verbose
+        cmake --build build --config Release
 
     - name: Deploy Qt DLLs
       shell: pwsh
