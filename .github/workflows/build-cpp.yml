@@ -1,0 +1,90 @@
+name: Build C++ Exe
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'cpp/**'
+      - '.github/workflows/build-cpp.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'cpp/**'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: cpp
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: '6.7.0'
+        host: 'windows'
+        target: 'desktop'
+        arch: 'win64_msvc2019_64'
+        modules: 'qtbase qtsvg'
+        tools: 'tools_cmake'
+
+    - name: Configure
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Deploy Qt DLLs
+      run: |
+        $exe = Get-ChildItem -Path build/Release -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
+        if ($exe) {
+          windeployqt "$($exe.FullName)" --release
+        }
+
+    - name: Package
+      run: |
+        $exe = Get-ChildItem -Path build/Release -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
+        if ($exe) {
+          $dir = Split-Path -Parent $exe.FullName
+          Compress-Archive -Path "$dir\*" -DestinationPath "WSDAutoDrawer-Windows.zip" -Force
+        }
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WSDAutoDrawer-Windows
+        path: cpp/WSDAutoDrawer-Windows.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cpp
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: '6.7.0'
+        host: 'linux'
+        target: 'desktop'
+        arch: 'gcc_64'
+        modules: 'qtbase qtsvg'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev
+
+    - name: Configure
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WSDAutoDrawer-Linux
+        path: cpp/build/WSDAutoDrawer

@@ -1,8 +1,11 @@
 # WSD Auto Drawer
 
 [![CI](https://github.com/famoustao/wsd-auto-drawer/actions/workflows/ci.yml/badge.svg)](https://github.com/famoustao/wsd-auto-drawer/actions/workflows/ci.yml)
+[![Build C++](https://github.com/famoustao/wsd-auto-drawer/actions/workflows/build-cpp.yml/badge.svg)](https://github.com/famoustao/wsd-auto-drawer/actions/workflows/build-cpp.yml)
 
 SVG 与 WSD 双向转换工具，基于 EduEditor WStudio7 格式的逆向工程实现。
+
+提供 **Python** 和 **C++ (Qt6 GUI)** 两个版本。
 
 ## 功能特性
 
@@ -10,6 +13,7 @@ SVG 与 WSD 双向转换工具，基于 EduEditor WStudio7 格式的逆向工程
 - **WSD 转 SVG**：将 `.wsd` 文件还原为 SVG 矢量图
 - **批量转换**：支持目录级别的批量处理
 - **双向无损**：基于逆向分析的精确格式还原
+- **Qt6 GUI**：C++ 版本提供原生桌面界面，自动编译为 Windows exe
 
 ## WSD 格式规范（逆向工程）
 
@@ -125,6 +129,70 @@ python -m unittest tests.test_conversion -v
 - 代码风格检查（flake8）
 - 单元测试和集成测试
 - 自动构建分发包
+
+## C++ 版本 (Qt6 GUI)
+
+提供高性能原生桌面应用，支持 Windows/Linux 自动编译。
+
+### 下载预编译 exe
+
+每次 push 后，GitHub Actions 自动编译 Windows exe 并上传 artifact：
+- 进入 [Actions → Build C++ Exe](https://github.com/famoustao/wsd-auto-drawer/actions/workflows/build-cpp.yml)
+- 下载最新的 `WSDAutoDrawer-Windows.zip`
+- 解压后双击 `WSDAutoDrawer.exe` 即可使用（无需安装 Qt）
+
+### 自行编译
+
+```bash
+cd cpp
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
+```
+
+### C++ 版本特性
+
+- **Qt6 Widgets 原生 GUI**：流畅的桌面体验
+- **多线程批量转换**：后台 Worker 线程，UI 不卡顿
+- **实时进度条**：显示当前处理文件和进度
+- **批量日志**：每条转换结果实时显示
+- **windeployqt 自动打包**：Windows 版本包含所有 Qt DLL，解压即用
+
+### C++ 技术栈
+
+- C++17
+- Qt6 (Core, Gui, Widgets)
+- CMake 3.20+
+- tinyxml2 (内嵌)
+
+## 文件结构
+
+```
+wsd-auto-drawer/
+├── main.py              # Python 命令行入口
+├── gui.py               # Python 桌面 GUI (tkinter)
+├── web_ui.py            # Python Web 界面 (Flask)
+├── cpp/                 # C++ 版本 (Qt6)
+│   ├── CMakeLists.txt
+│   └── src/
+│       ├── main.cpp
+│       ├── wsd_format.cpp/h
+│       ├── wsd_parser.cpp/h
+│       ├── wsd_writer.cpp/h
+│       ├── svg_parser.cpp/h
+│       ├── converter.cpp/h
+│       └── gui/
+│           ├── mainwindow.cpp/h/ui
+│   └── third_party/
+│       └── tinyxml2/
+├── svg_to_wsd.py
+├── wsd_to_svg.py
+├── tests/
+├── .github/workflows/
+│   ├── ci.yml           # Python CI
+│   └── build-cpp.yml    # C++ Windows/Linux 自动编译
+└── README.md
+```
 
 ## 许可证
 

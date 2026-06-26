@@ -1,0 +1,13 @@
+#include <QApplication>
+#include "gui/mainwindow.h"
+
+int main(int argc, char* argv[]) {
+    QApplication app(argc, argv);
+    app.setApplicationName("WSD Auto Drawer");
+    app.setOrganizationName("WSDDrawer");
+
+    MainWindow window;
+    window.show();
+
+    return app.exec();
+}
