@@ -13,11 +13,6 @@ void Writer::write(const std::string& filepath, const std::vector<Object>& objec
     file.write(FileHeader::MAGIC, 8);
     file.put(FileHeader::VERSION);
 
-    // 字体表填充
-    file.write(reinterpret_cast<const char*>(OBJECT_HEADER), 41);
-    char padding[100] = {0};
-    file.write(padding, 100);
-
     // 写入对象
     for (const auto& obj : objects) {
         // 对象头

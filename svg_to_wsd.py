@@ -369,9 +369,7 @@ class WSDWriter:
             # 写入文件头
             f.write(b'\x00')  # 偏移0的填充字节
             f.write(b'WSTUDIO7')
-            
-            # 写入字体表区域（简化，直接填充）
-            f.write(b'\x00' * 100)
+            f.write(b'\x07')  # 版本号
             
             # 写入每个对象
             for obj in self.objects:
