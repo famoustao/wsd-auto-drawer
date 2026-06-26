@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#endif
 #include "svg_parser.h"
 #include "tinyxml2.h"
 #include <fstream>
