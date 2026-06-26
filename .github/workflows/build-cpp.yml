@@ -23,12 +23,11 @@ jobs:
     - name: Install Qt
       uses: jurplel/install-qt-action@v4
       with:
-        version: '6.7.0'
+        version: '6.5.3'
         host: 'windows'
         target: 'desktop'
         arch: 'win64_msvc2019_64'
-        modules: 'qtbase qtsvg'
-        tools: 'tools_cmake'
+        cache: true
 
     - name: Configure
       run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
@@ -37,18 +36,31 @@ jobs:
       run: cmake --build build --config Release
 
     - name: Deploy Qt DLLs
+      shell: pwsh
       run: |
         $exe = Get-ChildItem -Path build/Release -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
         if ($exe) {
           windeployqt "$($exe.FullName)" --release
+          Write-Host "Deployed: $($exe.FullName)"
+        } else {
+          $exe2 = Get-ChildItem -Path build -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
+          if ($exe2) {
+            windeployqt "$($exe2.FullName)" --release
+            Write-Host "Deployed: $($exe2.FullName)"
+          }
         }
 
     - name: Package
+      shell: pwsh
       run: |
         $exe = Get-ChildItem -Path build/Release -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
+        if (-not $exe) {
+          $exe = Get-ChildItem -Path build -Filter "WSDAutoDrawer.exe" -Recurse | Select-Object -First 1
+        }
         if ($exe) {
           $dir = Split-Path -Parent $exe.FullName
           Compress-Archive -Path "$dir\*" -DestinationPath "WSDAutoDrawer-Windows.zip" -Force
+          Write-Host "Packaged: $dir"
         }
 
     - name: Upload Artifact
@@ -58,7 +70,7 @@ jobs:
         path: cpp/WSDAutoDrawer-Windows.zip
 
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: cpp
@@ -68,11 +80,12 @@ jobs:
     - name: Install Qt
       uses: jurplel/install-qt-action@v4
       with:
-        version: '6.7.0'
+        version: '6.5.3'
         host: 'linux'
         target: 'desktop'
         arch: 'gcc_64'
-        modules: 'qtbase qtsvg'
+        modules: 'qtbase'
+        cache: true
 
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev
