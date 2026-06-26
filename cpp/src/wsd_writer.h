@@ -50,12 +50,18 @@ struct CoordRegion {
     size_t offset;          // 数据在文件中的偏移
     uint16_t count;         // 坐标点数
     bool isUint32;          // true=uint32格式(可修改), false=float格式(不可修改)
+    std::string fmt;        // 格式标记: "xy_pairs"(默认,每点8字节X/Y对), "uint32_type01"(每4字节一个uint32值)
 };
 
 // 单条记录
+// recordType 说明:
+//   0x00 = 未知类型（启发式方法解析）
+//   0x01 = 旋转矩阵记录（77字节，坐标在marker+56,60,64,68,72,76，格式为 uint32_type01）
+//   0x04 = 直接坐标记录（53字节，坐标在marker+36为x1,y1,x2,y2，uint32各4字节）
 struct Record {
     size_t markerOffset;    // 记录标记在文件中的绝对偏移
     int canvasIndex;        // 所属画布索引
+    uint8_t recordType;     // 记录类型: 0x01=旋转矩阵, 0x04=直接坐标, 0x00=未知
     std::array<uint8_t, 4> color;       // 4字节颜色索引
     uint32_t lineWidthRaw;                // uint32 LE 线宽原始值（毫米 * 400）
     std::vector<CoordRegion> coordRegions; // 坐标区域列表
@@ -85,6 +91,13 @@ struct Modification {
 
 class Writer {
 public:
+    // ============================================================
+    //  记录类型常量（基于 byte 31 识别）
+    // ============================================================
+    static constexpr size_t TYPE01_SIZE = 77;       // 旋转矩阵记录大小 (byte31=0x01)
+    static constexpr size_t TYPE04_SIZE = 53;       // 直接坐标记录大小 (byte31=0x04)
+    static constexpr size_t COMMON_TAIL_SIZE = 31;  // 公共尾部大小（用于从记录末尾反推尾部数据）
+
     /// 旧模式（从零生成，无法被 EduEditor 打开）
     void write(const std::string& filepath, const std::vector<Object>& objects);
 
@@ -162,6 +175,26 @@ public:
     /// 获取指定记录的详细信息
     /// 返回 nullptr 如果索引无效
     const Record* getRecordInfo(size_t recordIndex) const;
+
+    /// 获取指定记录的旋转角度（仅 Type 0x01 有效）
+    /// 从旋转矩阵的 uint32 值计算角度（弧度转角度）
+    /// recordIndex: 记录索引
+    /// 返回旋转角度（度），如果无效返回 0.0f
+    float getRotationAngle(int recordIndex) const;
+
+    /// 获取指定记录的端点坐标列表
+    /// Type 0x04: 返回 (x1,y1), (x2,y2)
+    /// Type 0x01: 返回旋转矩阵的坐标值对
+    /// recordIndex: 记录索引
+    std::vector<std::pair<uint32_t,uint32_t>> getEndpointCoords(int recordIndex) const;
+
+    /// 修改指定记录的端点坐标
+    /// Type 0x04: 修改 marker+36 处的 x1,y1,x2,y2 (各uint32)
+    /// Type 0x01: 修改 marker+56,60,64,68,72,76 处的旋转矩阵坐标
+    /// recordIndex: 记录索引
+    /// newCoords: 新端点坐标列表
+    /// 成功返回 true
+    bool modifyRecordEndpoints(int recordIndex, const std::vector<std::pair<uint32_t,uint32_t>>& newCoords);
 
     /// 通过颜色名查找颜色索引字节
     /// 返回 true 找到，result 中填入4字节颜色索引

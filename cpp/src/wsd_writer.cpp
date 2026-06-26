@@ -273,7 +273,9 @@ bool Writer::loadRecordFile(const std::string& wsd_path) {
 }
 
 bool Writer::parseRecords() {
-    // 解析文件尾部记录表 - 查找所有 0f 33 ff 00 07 标记
+    // 解析文件尾部记录表 - 两遍扫描
+    // 第一遍: 找到所有 marker 位置
+    // 第二遍: 根据 byte 31 识别记录类型并逐条解析
     if (recordData.empty()) return false;
 
     records.clear();
@@ -282,9 +284,10 @@ bool Writer::parseRecords() {
     // 从文件后半部分开始搜索（记录表通常在文件尾部）
     const size_t searchStart = (fileSize > 200) ? (fileSize / 2) : 0;
 
+    // ========== 第一遍：找到所有 marker 位置 ==========
+    std::vector<size_t> markerPositions;
     size_t i = searchStart;
     while (i + 32 < fileSize) {
-        // 查找记录标记: 0f 33 ff 00 07
         if (recordData[i] == 0x0f &&
             recordData[i + 1] == 0x33 &&
             recordData[i + 2] == 0xff &&
@@ -296,107 +299,162 @@ bool Writer::parseRecords() {
                 recordData[i + 5] == 0x04 &&
                 recordData[i + 6] == 0xff &&
                 recordData[i + 7] == 0xff) {
-
-                // 提取颜色索引 (marker+8, 4字节)
-                Record rec;
-                rec.markerOffset = i;
-                rec.canvasIndex = static_cast<int>(records.size());
-                std::copy(recordData.begin() + i + COLOR_OFFSET,
-                          recordData.begin() + i + COLOR_OFFSET + 4,
-                          rec.color.begin());
-
-                // 提取线宽 (marker+16, uint32 LE, 毫米 * 400)
-                if (i + LINEWIDTH_OFFSET + 4 <= fileSize) {
-                    rec.lineWidthRaw = *reinterpret_cast<const uint32_t*>(
-                        recordData.data() + i + LINEWIDTH_OFFSET);
-                } else {
-                    rec.lineWidthRaw = 0;
-                }
-
-                // 解析坐标数据区域 (marker+32 起)
-                rec.coordRegions.clear();
-                size_t pos = i + COORD_DATA_START;
-
-                while (pos + 6 < fileSize) {
-                    // 检测是否到达下一条记录
-                    if (recordData[pos] == 0x0f && pos + 4 < fileSize &&
-                        recordData[pos + 1] == 0x33 &&
-                        recordData[pos + 2] == 0xff) {
-                        break;  // 下一条记录标记
-                    }
-
-                    // 检测 uint32 坐标格式
-                    // 格式: type(2B BE) + header(2B BE) + count(2B BE) + X/Y 对 (各4字节 LE)
-                    uint16_t coordType   = (recordData[pos] << 8) | recordData[pos + 1];
-                    uint16_t coordHeader = (recordData[pos + 2] << 8) | recordData[pos + 3];
-                    uint16_t coordCount  = (recordData[pos + 4] << 8) | recordData[pos + 5];
-
-                    // 合理性检查
-                    if (coordCount > 0 && coordCount <= 50000 &&
-                        coordType > 0 && coordType < 0x0500 &&
-                        coordHeader < 0x1000) {
-
-                        const size_t coordDataSize = static_cast<size_t>(coordCount) * 8;
-                        if (pos + 6 + coordDataSize <= fileSize) {
-                            rec.coordRegions.push_back({
-                                pos + 6,       // 数据偏移
-                                coordCount,    // 点数
-                                true           // uint32 格式（可修改）
-                            });
-                            pos = pos + 6 + coordDataSize;
-                            continue;
-                        }
-                    }
-
-                    // float 格式区域（画布参数）- 跳过，不修改
-                    // 查找下一个结构标记
-                    size_t scanEnd = std::min(pos + 200, fileSize - 4);
-                    size_t floatBytes = 0;
-                    while (pos + floatBytes < scanEnd) {
-                        if (recordData[pos + floatBytes] == 0x0f &&
-                            recordData[pos + floatBytes + 1] == 0x33 &&
-                            recordData[pos + floatBytes + 2] == 0xff) {
-                            break;
-                        }
-                        floatBytes++;
-                    }
-
-                    if (floatBytes > 16) {
-                        // float 区域（画布参数），标记但不可修改
-                        rec.coordRegions.push_back({
-                            pos,
-                            static_cast<uint16_t>(floatBytes / 4),
-                            false  // float 格式（不可修改）
-                        });
-                        pos += floatBytes;
-                    } else {
-                        pos++;
-                    }
-                }
-
-                // 计算记录大小
-                if (!records.empty()) {
-                    rec.recordSize = i - records.back().markerOffset;
-                } else {
-                    // 最后一条（最早发现的）记录，到文件末尾减去校验和(8字节)
-                    rec.recordSize = fileSize - i - 8;
-                }
-
-                records.push_back(rec);
-
-                // 跳过已解析区域
-                i += std::max(rec.recordSize, static_cast<size_t>(32));
-                continue;
+                markerPositions.push_back(i);
             }
         }
         i++;
     }
 
-    // 按偏移排序（从文件头到尾的顺序）
-    std::sort(records.begin(), records.end(),
-              [](const Record& a, const Record& b) {
-                  return a.markerOffset < b.markerOffset;
-              });
+    if (markerPositions.empty()) return false;
+
+    // 按偏移排序
+    std::sort(markerPositions.begin(), markerPositions.end());
+
+    // ========== 第二遍：逐条解析，根据 byte 31 识别记录类型 ==========
+    for (size_t mi = 0; mi < markerPositions.size(); ++mi) {
+        size_t m = markerPositions[mi];
+        Record rec;
+        rec.markerOffset = m;
+        rec.canvasIndex = 0;
+        rec.recordType = 0x00;
+
+        // 读取 byte 31 (marker+31) 确定记录类型
+        if (m + 32 <= fileSize) {
+            uint8_t typeByte = recordData[m + 31];
+            rec.recordType = typeByte;
+        }
+
+        // 提取颜色索引 (marker+8, 4字节)
+        std::copy(recordData.begin() + m + COLOR_OFFSET,
+                  recordData.begin() + m + COLOR_OFFSET + 4,
+                  rec.color.begin());
+
+        // 提取线宽 (marker+16, uint32 LE, 毫米 * 400)
+        if (m + LINEWIDTH_OFFSET + 4 <= fileSize) {
+            rec.lineWidthRaw = *reinterpret_cast<const uint32_t*>(
+                recordData.data() + m + LINEWIDTH_OFFSET);
+        } else {
+            rec.lineWidthRaw = 0;
+        }
+
+        // 根据类型解析坐标区域
+        rec.coordRegions.clear();
+
+        if (rec.recordType == 0x04 && m + TYPE04_SIZE <= fileSize) {
+            // ===== Type 0x04: 直接坐标记录 (53字节) =====
+            // marker+34-35: endpoint count (uint16 LE)
+            uint16_t epCount = static_cast<uint16_t>(
+                recordData[m + 34] | (recordData[m + 35] << 8));
+
+            // marker+36: 坐标数据 (x1,y1,x2,y2，各 uint32 LE，4字节)
+            size_t coordOffset = m + 36;
+            size_t coordPairs = epCount > 0 ? epCount : 2; // 默认2个点 (起点+终点)
+
+            rec.coordRegions.push_back({
+                coordOffset,                    // 数据偏移
+                static_cast<uint16_t>(coordPairs), // 点数
+                true,                           // uint32 格式
+                "xy_pairs"                      // 格式标记
+            });
+
+            rec.recordSize = TYPE04_SIZE;
+
+        } else if (rec.recordType == 0x01 && m + TYPE01_SIZE <= fileSize) {
+            // ===== Type 0x01: 旋转矩阵记录 (77字节) =====
+            // 坐标在 marker+56, 60, 64, 68, 72, 76 (各 uint32，共6个值)
+            // 格式为 'uint32_type01': 每4字节一个uint32值 (非X/Y对)
+            size_t coordOffsets[] = {56, 60, 64, 68, 72, 76};
+
+            // 将旋转矩阵坐标作为一个整体区域存储
+            rec.coordRegions.push_back({
+                m + 56,         // 数据偏移
+                6,              // 6个uint32值
+                true,           // uint32 格式
+                "uint32_type01" // 格式标记: 每4字节一个uint32值
+            });
+
+            rec.recordSize = TYPE01_SIZE;
+
+        } else {
+            // ===== 未知类型: 使用启发式方法解析 =====
+            // 回退到旧的逐区域扫描逻辑
+            size_t pos = m + COORD_DATA_START;
+
+            while (pos + 6 < fileSize) {
+                // 检测是否到达下一条记录
+                bool hitNextMarker = false;
+                for (size_t nk = mi + 1; nk < markerPositions.size(); ++nk) {
+                    if (pos == markerPositions[nk]) {
+                        hitNextMarker = true;
+                        break;
+                    }
+                }
+                if (hitNextMarker) break;
+
+                // 简单检测下一个marker前缀
+                if (recordData[pos] == 0x0f && pos + 4 < fileSize &&
+                    recordData[pos + 1] == 0x33 &&
+                    recordData[pos + 2] == 0xff) {
+                    break;
+                }
+
+                // 检测 uint32 坐标格式
+                uint16_t coordType   = (recordData[pos] << 8) | recordData[pos + 1];
+                uint16_t coordHeader = (recordData[pos + 2] << 8) | recordData[pos + 3];
+                uint16_t coordCount  = (recordData[pos + 4] << 8) | recordData[pos + 5];
+
+                if (coordCount > 0 && coordCount <= 50000 &&
+                    coordType > 0 && coordType < 0x0500 &&
+                    coordHeader < 0x1000) {
+
+                    const size_t coordDataSize = static_cast<size_t>(coordCount) * 8;
+                    if (pos + 6 + coordDataSize <= fileSize) {
+                        rec.coordRegions.push_back({
+                            pos + 6,       // 数据偏移
+                            coordCount,    // 点数
+                            true,          // uint32 格式
+                            "xy_pairs"     // 默认格式
+                        });
+                        pos = pos + 6 + coordDataSize;
+                        continue;
+                    }
+                }
+
+                // float 格式区域 - 跳过
+                size_t scanEnd = std::min(pos + 200, fileSize - 4);
+                size_t floatBytes = 0;
+                while (pos + floatBytes < scanEnd) {
+                    if (recordData[pos + floatBytes] == 0x0f &&
+                        recordData[pos + floatBytes + 1] == 0x33 &&
+                        recordData[pos + floatBytes + 2] == 0xff) {
+                        break;
+                    }
+                    floatBytes++;
+                }
+
+                if (floatBytes > 16) {
+                    rec.coordRegions.push_back({
+                        pos,
+                        static_cast<uint16_t>(floatBytes / 4),
+                        false,         // float 格式
+                        "float"        // 格式标记
+                    });
+                    pos += floatBytes;
+                } else {
+                    pos++;
+                }
+            }
+
+            // 启发式计算记录大小
+            if (mi + 1 < markerPositions.size()) {
+                rec.recordSize = markerPositions[mi + 1] - m;
+            } else {
+                rec.recordSize = fileSize - m - 8;
+            }
+        }
+
+        records.push_back(rec);
+    }
 
     // 分配画布索引
     assignCanvasIndices();
@@ -494,8 +552,11 @@ bool Writer::modifyRecordCoordinates(
     const std::vector<std::pair<uint32_t, uint32_t>>& newCoords)
 {
     // 修改指定记录中 uint32 格式的坐标数据
-    // 仅支持 uint32 格式，float 格式不可修改
-    // 点数必须与原始相同以保证文件大小不变
+    // 支持两种格式:
+    //   "xy_pairs" (默认): 每点8字节 (X:4字节 + Y:4字节)
+    //   "uint32_type01": 每4字节一个uint32值，pair的first和second分别写入相邻的4字节
+    // float 格式不可修改
+    // 值的总数必须与原始 count 匹配以保证文件大小不变
 
     if (recordIndex >= records.size()) return false;
 
@@ -505,9 +566,46 @@ bool Writer::modifyRecordCoordinates(
     const CoordRegion& region = rec.coordRegions[coordIndex];
     if (!region.isUint32) return false;  // float 格式不可修改
 
+    if (region.fmt == "uint32_type01") {
+        // uint32_type01 格式: 每4字节一个uint32值
+        // count 表示值的总个数（非点对数）
+        // newCoords 每对提供2个连续的uint32值
+        // 总共需要 count 个值 => 需要 (count+1)/2 个 pair
+        size_t totalValues = static_cast<size_t>(region.count);
+        size_t neededPairs = (totalValues + 1) / 2;
+        if (newCoords.size() < neededPairs) return false;
+
+        size_t valueIdx = 0;
+        for (size_t p = 0; p < newCoords.size() && valueIdx < totalValues; ++p) {
+            // 写入 pair.first
+            if (valueIdx < totalValues) {
+                size_t pos = region.offset + valueIdx * 4;
+                if (pos + 4 > recordData.size()) return false;
+                uint32_t val = newCoords[p].first;
+                recordData[pos]     = static_cast<uint8_t>(val & 0xFF);
+                recordData[pos + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
+                recordData[pos + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
+                recordData[pos + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
+                valueIdx++;
+            }
+            // 写入 pair.second
+            if (valueIdx < totalValues) {
+                size_t pos = region.offset + valueIdx * 4;
+                if (pos + 4 > recordData.size()) return false;
+                uint32_t val = newCoords[p].second;
+                recordData[pos]     = static_cast<uint8_t>(val & 0xFF);
+                recordData[pos + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
+                recordData[pos + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
+                recordData[pos + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
+                valueIdx++;
+            }
+        }
+        return true;
+    }
+
+    // 默认 xy_pairs 格式: 每点8字节 (X:4字节 + Y:4字节)
     if (newCoords.size() != region.count) return false;  // 点数必须匹配
 
-    // 逐点写入 uint32 LE 坐标 (X: 4字节, Y: 4字节)
     for (size_t j = 0; j < newCoords.size(); ++j) {
         size_t pos = region.offset + j * 8;
 
@@ -535,6 +633,118 @@ const Record* Writer::getRecordInfo(size_t recordIndex) const {
     // 获取指定记录的详细信息
     if (recordIndex >= records.size()) return nullptr;
     return &records[recordIndex];
+}
+
+float Writer::getRotationAngle(int recordIndex) const {
+    // 获取指定记录的旋转角度（仅 Type 0x01 有效）
+    // 从旋转矩阵的 uint32 值计算角度（弧度转角度）
+    if (recordIndex < 0 || static_cast<size_t>(recordIndex) >= records.size()) return 0.0f;
+
+    const Record& rec = records[recordIndex];
+    if (rec.recordType != 0x01) return 0.0f;
+
+    // 旋转矩阵坐标在 marker+56,60,64,68,72,76 (uint32_type01格式)
+    // 第一个值 (marker+56) 作为角度参数，使用 atan2 计算
+    size_t m = rec.markerOffset;
+    if (m + 76 + 4 > recordData.size()) return 0.0f;
+
+    uint32_t val56 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 56);
+    uint32_t val60 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 60);
+
+    // 将 uint32 值转为浮点数用于角度计算
+    // 这些值通常是以定点数存储的 sin/cos 分量
+    float sinVal = static_cast<float>(val56) / 10000.0f;
+    float cosVal = static_cast<float>(val60) / 10000.0f;
+
+    float angleRad = std::atan2(sinVal, cosVal);
+    float angleDeg = angleRad * 180.0f / static_cast<float>(M_PI);
+
+    return angleDeg;
+}
+
+std::vector<std::pair<uint32_t,uint32_t>> Writer::getEndpointCoords(int recordIndex) const {
+    // 获取指定记录的端点坐标列表
+    std::vector<std::pair<uint32_t,uint32_t>> result;
+
+    if (recordIndex < 0 || static_cast<size_t>(recordIndex) >= records.size()) return result;
+
+    const Record& rec = records[recordIndex];
+    size_t m = rec.markerOffset;
+
+    if (rec.recordType == 0x04) {
+        // Type 0x04: 坐标在 marker+36 (x1,y1,x2,y2，各 uint32 LE，4字节)
+        if (m + 36 + 16 <= recordData.size()) {
+            uint32_t x1 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 36);
+            uint32_t y1 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 40);
+            uint32_t x2 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 44);
+            uint32_t y2 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 48);
+            result.push_back({x1, y1});
+            result.push_back({x2, y2});
+        }
+    } else if (rec.recordType == 0x01) {
+        // Type 0x01: 坐标在 marker+56,60,64,68,72,76 (各 uint32)
+        // 返回为3个坐标对
+        if (m + 56 + 24 <= recordData.size()) {
+            uint32_t v0 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 56);
+            uint32_t v1 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 60);
+            uint32_t v2 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 64);
+            uint32_t v3 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 68);
+            uint32_t v4 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 72);
+            uint32_t v5 = *reinterpret_cast<const uint32_t*>(recordData.data() + m + 76);
+            result.push_back({v0, v1});
+            result.push_back({v2, v3});
+            result.push_back({v4, v5});
+        }
+    }
+    // 未知类型不返回坐标
+
+    return result;
+}
+
+bool Writer::modifyRecordEndpoints(int recordIndex, const std::vector<std::pair<uint32_t,uint32_t>>& newCoords) {
+    // 修改指定记录的端点坐标
+    if (recordIndex < 0 || static_cast<size_t>(recordIndex) >= records.size()) return false;
+
+    Record& rec = records[recordIndex];
+    size_t m = rec.markerOffset;
+
+    auto writeU32 = [&](size_t pos, uint32_t val) -> bool {
+        if (pos + 4 > recordData.size()) return false;
+        recordData[pos]     = static_cast<uint8_t>(val & 0xFF);
+        recordData[pos + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
+        recordData[pos + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
+        recordData[pos + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
+        return true;
+    };
+
+    if (rec.recordType == 0x04) {
+        // Type 0x04: 修改 marker+36 处的 x1,y1,x2,y2 (各uint32)
+        // 需要2个坐标对
+        if (newCoords.size() < 2) return false;
+
+        bool ok = true;
+        ok &= writeU32(m + 36, newCoords[0].first);   // x1
+        ok &= writeU32(m + 40, newCoords[0].second);   // y1
+        ok &= writeU32(m + 44, newCoords[1].first);    // x2
+        ok &= writeU32(m + 48, newCoords[1].second);   // y2
+        return ok;
+
+    } else if (rec.recordType == 0x01) {
+        // Type 0x01: 修改 marker+56,60,64,68,72,76 处的旋转矩阵坐标
+        // 需要3个坐标对 (6个uint32值)
+        if (newCoords.size() < 3) return false;
+
+        bool ok = true;
+        ok &= writeU32(m + 56, newCoords[0].first);    // val56
+        ok &= writeU32(m + 60, newCoords[0].second);   // val60
+        ok &= writeU32(m + 64, newCoords[1].first);    // val64
+        ok &= writeU32(m + 68, newCoords[1].second);   // val68
+        ok &= writeU32(m + 72, newCoords[2].first);    // val72
+        ok &= writeU32(m + 76, newCoords[2].second);   // val76
+        return ok;
+    }
+
+    return false;  // 未知类型不支持
 }
 
 bool Writer::modifyWSD(

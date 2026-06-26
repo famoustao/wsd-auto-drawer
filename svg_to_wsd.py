@@ -502,17 +502,61 @@ def resample_points(points: List[Tuple[float, float]], target_count: int) -> Lis
 # ============================================================
 #  WSD 记录表修改器 - 基于逆向工程的记录表结构
 # ============================================================
+#
+# 记录表结构（通过对比 2000.wsd / 2000+.wsd / line.wsd 破解）:
+#
+# 文件尾部包含记录表，每条线段/图形是一条"sub-record"。
+# 多条 sub-record 共享同一个画布。
+#
+# [marker: 0f 33 ff 00 07]  <-- 记录表起始标记
+# [sub-record 1]             <-- 可变长度
+# [sub-record 2]             <-- 可选，多条线时重复
+# ...
+# [公共尾部: 31字节]         <-- 所有 sub-record 共享
+# [画布共享数据: 变长]
+# [文件尾: filesize_le32 + ffffffff]
+#
+# sub-record 结构:
+#   [0-4]:   marker (0f 33 ff 00 07)
+#   [5-7]:   field marker (04 ff ff)
+#   [8-11]:  color (4字节颜色索引)
+#   [12-15]: padding
+#   [16-19]: line width (uint32 LE = mm × 400)
+#   [20-27]: common flags
+#   [28-31]: type header (byte 28-30=0x00, byte 31=类型)
+#
+# Type 0x01 (旋转矩阵格式, 共77字节):
+#   [32-33]: format flag = 0x47 0x3f
+#   [34-49]: 2D旋转矩阵 (4 floats, 2-byte aligned: cos, -sin, sin, cos)
+#            编码线段方向角, cos^2+sin^2=1.0
+#   [50-76]: 线段特定参数 (27字节, 含位置/尺寸 uint32)
+#
+# Type 0x04 (直接坐标格式, 共53字节):
+#   [32-33]: format flag = 0x47 0x00
+#   [34-35]: endpoint count (uint16 LE, 通常=2)
+#   [36-39]: x1 (uint32 LE)
+#   [40-43]: y1 (uint32 LE)
+#   [44-47]: x2 (uint32 LE)
+#   [48-51]: y2 (uint32 LE)
+#   [52]:    terminator (0x64)
+#
+# 画布尺寸存储在记录表之前的 pre-record 区域:
+#   [pre_offset+0..1]: canvas_width (uint16 LE, 1/400mm)
+#   [pre_offset+2..3]: padding
+#   [pre_offset+4..5]: canvas_height (uint16 LE, 1/400mm)
+# ============================================================
 
 @dataclass
 class WSDRecord:
-    """单个 WSD 记录（文件尾部记录表中的一条记录）"""
+    """单个 WSD 记录（文件尾部记录表中的一条线段 sub-record）"""
     marker_offset: int      # 记录标记 (0f 33 ff 00 07) 在文件中的绝对偏移
     canvas_index: int       # 所属画布索引（支持多画布）
     color: bytes             # 4字节颜色索引
     line_width_raw: int     # uint32 LE 线宽原始值（毫米 * 400）
+    record_type: int        # sub-record 类型: 0x01=旋转矩阵, 0x04=直接坐标
     coord_regions: List     # 坐标区域列表: [(offset, count, fmt), ...]
                             #   fmt: 'uint32' 或 'float'
-    record_size: int        # 记录总大小（从标记到下一条记录或尾部）
+    record_size: int        # 记录总大小（从标记到下一条记录或公共尾部）
 
 
 class WSDRecordModifier:
@@ -521,13 +565,28 @@ class WSDRecordModifier:
     
     基于逆向工程验证的记录表格式，可以：
     - 解析文件尾部的记录表（查找 0f 33 ff 00 07 标记）
+    - 识别 Type 0x01（旋转矩阵）和 Type 0x04（直接坐标）两种格式
     - 修改记录的颜色、线宽、uint32 坐标
-    - 支持多画布文件
+    - 支持多线段、多画布文件
     - 保持文件大小不变（关键要求！）
     
     记录表位于文件尾部，每条记录以 0f 33 ff 00 07 标记开始。
     文件末尾有校验和: filesize_le32 + ff ff ff ff
     """
+
+    # Type 0x01 sub-record 大小
+    TYPE01_SIZE = 77
+    # Type 0x04 sub-record 大小
+    TYPE04_SIZE = 53
+    # 公共尾部大小（所有 sub-record 之后共享）
+    COMMON_TAIL_SIZE = 31
+    # 公共尾部签名（用于验证）
+    COMMON_TAIL_SIGNATURE = bytes([
+        0x88, 0x45, 0x00, 0x00, 0x38, 0x31, 0x00, 0x00,
+        0x88, 0x45, 0x00, 0x00, 0x38, 0x31, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x32, 0x00, 0x10, 0xf5, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x01,
+    ])
 
     def __init__(self, wsd_path: str):
         """
@@ -547,116 +606,116 @@ class WSDRecordModifier:
         """
         解析记录表 - 在文件尾部查找所有 0f 33 ff 00 07 标记
         
-        返回找到的记录列表。每条记录包含标记偏移、颜色、线宽等信息。
+        识别两种 sub-record 类型:
+          - Type 0x01: 旋转矩阵格式（77字节，含方向角cos/sin编码）
+          - Type 0x04: 直接坐标格式（53字节，含uint32端点 x1,y1,x2,y2）
+        
+        返回找到的记录列表。每条记录包含标记偏移、颜色、线宽、类型等信息。
         支持多画布文件（每条记录关联一个画布索引）。
         """
         self.records = []
         data = self.data
         file_size = len(data)
 
-        # 从文件尾部向前搜索记录标记
-        # 记录表通常从文件尾部约 1/4 处开始
+        # 从文件后半部分搜索记录标记
         search_start = max(0, file_size - file_size // 2)
 
+        # 第一遍：找到所有标记位置
+        markers = []
         i = search_start
-        while i < file_size - 32:  # 至少留 32 字节给记录头
-            # 查找记录标记: 0f 33 ff 00 07
+        while i < file_size - 32:
             if (data[i] == 0x0f and data[i + 1] == 0x33 and
                 data[i + 2] == 0xff and data[i + 3] == 0x00 and
                 data[i + 4] == 0x07):
-
-                # 验证字段标记: 04 ff ff 在 marker+5
+                # 验证字段标记: 04 ff ff
                 if (i + 8 < file_size and
                     data[i + 5] == 0x04 and data[i + 6] == 0xff and
                     data[i + 7] == 0xff):
-
-                    # 提取颜色索引 (marker+8, 4字节)
-                    color = bytes(data[i + COLOR_OFFSET:i + COLOR_OFFSET + 4])
-
-                    # 提取线宽 (marker+16, uint32 LE, 毫米 * 400)
-                    if i + LINEWIDTH_OFFSET + 4 <= file_size:
-                        lw_raw = struct.unpack('<I', data[i + LINEWIDTH_OFFSET:i + LINEWIDTH_OFFSET + 4])[0]
-                    else:
-                        lw_raw = 0
-
-                    # 解析坐标数据区域 (marker+32 起)
-                    coord_regions = []
-                    pos = i + COORD_DATA_START
-                    canvas_idx = len(self.records)  # 默认画布索引
-
-                    while pos < file_size - 8:
-                        # 检测是否到达下一条记录或文件尾部
-                        if (data[pos] == 0x0f and pos + 4 < file_size and
-                            data[pos + 1] == 0x33 and data[pos + 2] == 0xff):
-                            break  # 下一条记录标记
-
-                        # 检测 uint32 坐标格式
-                        # 格式: type(2B) + header(2B) + count(2B) + X/Y 对 (每对 4+4=8 字节)
-                        if pos + 6 <= file_size:
-                            coord_type = struct.unpack('>H', data[pos:pos + 2])[0]
-                            coord_header = struct.unpack('>H', data[pos + 2:pos + 4])[0]
-                            coord_count = struct.unpack('>H', data[pos + 4:pos + 6])[0]
-
-                            # 合理性检查: count 不超过 50000，type 和 header 在合理范围
-                            if (1 <= coord_count <= 50000 and
-                                0 < coord_type < 0x0500 and
-                                coord_header < 0x1000):
-
-                                coord_data_size = coord_count * 8  # 每个坐标对 8 字节 (X: 4B, Y: 4B)
-                                if pos + 6 + coord_data_size <= file_size:
-                                    coord_regions.append((
-                                        pos + 6,      # 数据起始偏移
-                                        coord_count,  # 坐标点数
-                                        'uint32'       # 格式类型
-                                    ))
-                                    pos = pos + 6 + coord_data_size
-                                    continue
-
-                        # 如果不匹配 uint32 格式，尝试检测 float 格式（bounding box + transform）
-                        # float 格式用于画布参数，不修改，跳过
-                        # 通常有较大的连续 float 区域
-                        float_bytes = 0
-                        scan_end = min(pos + 200, file_size)
-                        while pos + float_bytes < scan_end:
-                            next_byte = data[pos + float_bytes]
-                            # 检测下一个结构标记
-                            if (next_byte == 0x0f and
-                                pos + float_bytes + 4 < file_size and
-                                data[pos + float_bytes + 1] == 0x33):
-                                break
-                            float_bytes += 1
-
-                        if float_bytes > 16:
-                            # 可能是 float 坐标区域（画布参数），标记但不修改
-                            coord_regions.append((pos, float_bytes // 4, 'float'))
-                            pos += float_bytes
-                        else:
-                            pos += 1
-
-                    # 计算记录大小
-                    if self.records:
-                        prev = self.records[-1]
-                        record_size = i - prev.marker_offset
-                    else:
-                        # 对于最后一条（最早发现的）记录，计算到文件末尾
-                        # 需要减去尾部校验和 (8字节: filesize_le32 + ffffffff)
-                        record_size = file_size - i - 8
-
-                    record = WSDRecord(
-                        marker_offset=i,
-                        canvas_index=canvas_idx,
-                        color=color,
-                        line_width_raw=lw_raw,
-                        coord_regions=coord_regions,
-                        record_size=record_size,
-                    )
-                    self.records.append(record)
-
-                    # 跳过已解析的记录区域
-                    i += max(record_size, 32)
-                    continue
-
+                    markers.append(i)
             i += 1
+
+        if not markers:
+            self._parsed = True
+            print("[记录表解析] 未找到任何记录标记")
+            return self.records
+
+        # 第二遍：逐条解析记录
+        for idx, marker_pos in enumerate(markers):
+            if marker_pos + 53 > file_size:
+                continue  # 至少需要 53 字节（type 0x04 最小大小）
+
+            # 提取颜色索引 (marker+8, 4字节)
+            color = bytes(data[marker_pos + COLOR_OFFSET:marker_pos + COLOR_OFFSET + 4])
+
+            # 提取线宽 (marker+16, uint32 LE, 毫米 * 400)
+            if marker_pos + LINEWIDTH_OFFSET + 4 <= file_size:
+                lw_raw = struct.unpack('<I', data[marker_pos + LINEWIDTH_OFFSET:marker_pos + LINEWIDTH_OFFSET + 4])[0]
+            else:
+                lw_raw = 0
+
+            # 识别 sub-record 类型 (byte 31)
+            record_type = data[marker_pos + 31]
+
+            # 解析坐标数据区域
+            coord_regions = []
+
+            if record_type == 0x04:
+                # Type 0x04: 直接坐标格式
+                # [34-35]: endpoint count (uint16 LE)
+                if marker_pos + 52 <= file_size:
+                    ep_count = struct.unpack('<H', data[marker_pos + 34:marker_pos + 36])[0]
+                    # 坐标在 marker+36: x1(4B), y1(4B), x2(4B), y2(4B)
+                    coord_regions.append((
+                        marker_pos + 36,   # 数据偏移
+                        ep_count,          # 端点数（通常=2）
+                        'uint32'           # 格式
+                    ))
+                # Type 0x04 的大小 = 53 字节
+                rec_size = self.TYPE04_SIZE
+
+            elif record_type == 0x01:
+                # Type 0x01: 旋转矩阵格式
+                # [34-49]: 2D旋转矩阵 (4 floats, 2-byte aligned)
+                # cos(marker+34), -sin(marker+38), sin(marker+42), cos(marker+46)
+                # 这些是方向角编码，cos^2+sin^2=1.0
+                # [50-76]: 位置/尺寸参数 (27字节 uint32 数据)
+                #
+                # 提取 uint32 坐标区域 (offset 56-76)
+                # 这些值代表线段在页面上的位置参数
+                for uoff in [56, 60, 64, 68, 72, 76]:
+                    if marker_pos + uoff + 4 <= file_size:
+                        coord_regions.append((
+                            marker_pos + uoff,
+                            1,  # 每个偏移一个 uint32 值
+                            'uint32_type01'  # Type 0x01 的位置参数
+                        ))
+                # Type 0x01 的大小 = 77 字节
+                rec_size = self.TYPE01_SIZE
+
+            else:
+                # 未知类型：使用启发式方法
+                rec_size = 77  # 默认
+                # 尝试在后续字节中查找 uint32 坐标对
+                scan_pos = marker_pos + 32
+                scan_end = min(scan_pos + 100, file_size)
+                while scan_pos < scan_end:
+                    if (data[scan_pos] == 0x0f and scan_pos + 4 < file_size and
+                        data[scan_pos + 1] == 0x33):
+                        break  # 下一条记录
+                    scan_pos += 1
+                if scan_pos > marker_pos + 32 + 16:
+                    coord_regions.append((marker_pos + 32, (scan_pos - marker_pos - 32) // 8, 'uint32'))
+
+            record = WSDRecord(
+                marker_offset=marker_pos,
+                canvas_index=idx,  # 临时值，后续由 _assign_canvas_indices 修正
+                color=color,
+                line_width_raw=lw_raw,
+                record_type=record_type,
+                coord_regions=coord_regions,
+                record_size=rec_size,
+            )
+            self.records.append(record)
 
         # 按偏移排序（从文件头到尾的顺序）
         self.records.sort(key=lambda r: r.marker_offset)
@@ -669,8 +728,10 @@ class WSDRecordModifier:
         for idx, rec in enumerate(self.records):
             color_name = COLOR_INDEX_REVERSE.get(rec.color, f'{rec.color.hex()}')
             lw_mm = rec.line_width_raw / 400.0 if rec.line_width_raw else 0
+            type_name = {0x01: '旋转矩阵', 0x04: '直接坐标'}.get(rec.record_type, f'未知({rec.record_type:#x})')
             print(f"  记录 {idx}: 画布={rec.canvas_index}, "
                   f"偏移=0x{rec.marker_offset:x}, "
+                  f"类型={type_name}, "
                   f"颜色={color_name}, "
                   f"线宽={lw_mm:.2f}mm, "
                   f"坐标区域={len(rec.coord_regions)}个")
@@ -783,13 +844,120 @@ class WSDRecordModifier:
         print(f"[线宽修改] 记录 {record_index}: 线宽 -> {line_width_mm:.2f}mm (raw={lw_raw})")
         return True
 
+    def getRotationAngle(self, record_index: int) -> Optional[float]:
+        """
+        获取 Type 0x01 记录的旋转角度（线段方向角）
+        
+        Type 0x01 记录在 offset 34-49 存储 2D 旋转矩阵:
+        [cos, -sin, sin, cos]，通过 atan2(sin, cos) 计算角度。
+        
+        Args:
+            record_index: 记录索引
+        
+        Returns:
+            角度（度），非 Type 0x01 返回 None
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            return None
+
+        rec = self.records[record_index]
+        if rec.record_type != 0x01:
+            return None
+
+        import math
+        base = rec.marker_offset
+        cos_val = struct.unpack('<f', self.data[base + 34:base + 38])[0]
+        sin_val = struct.unpack('<f', self.data[base + 42:base + 46])[0]
+        angle_deg = 360.0 / math.pi * math.atan2(sin_val, cos_val)
+        return angle_deg
+
+    def getEndpointCoords(self, record_index: int) -> Optional[List[Tuple[int, int]]]:
+        """
+        获取 Type 0x04 记录的端点坐标
+        
+        Type 0x04 记录在 offset 36 起存储直接 uint32 端点:
+        [x1, y1, x2, y2, ...]（每个 4 字节 LE）
+        
+        Args:
+            record_index: 记录索引
+        
+        Returns:
+            端点坐标列表 [(x, y), ...]，非 Type 0x04 返回 None
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            return None
+
+        rec = self.records[record_index]
+        if rec.record_type != 0x04:
+            return None
+
+        base = rec.marker_offset
+        ep_count = struct.unpack('<H', self.data[base + 34:base + 36])[0]
+        coords = []
+        for j in range(ep_count):
+            x = struct.unpack('<I', self.data[base + 36 + j * 8:base + 40 + j * 8])[0]
+            y = struct.unpack('<I', self.data[base + 40 + j * 8:base + 44 + j * 8])[0]
+            coords.append((x, y))
+        return coords
+
+    def modifyRecordEndpoints(self, record_index: int,
+                               new_coords: List[Tuple[int, int]]) -> bool:
+        """
+        修改 Type 0x04 记录的端点坐标
+        
+        直接修改 uint32 端点 x1,y1,x2,y2...。点数必须与原始相同。
+        
+        Args:
+            record_index: 记录索引
+            new_coords: 新端点坐标 [(x1, y1), (x2, y2), ...]
+        
+        Returns:
+            成功返回 True
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            print(f"错误: 记录索引 {record_index} 超出范围")
+            return False
+
+        rec = self.records[record_index]
+        if rec.record_type != 0x04:
+            print(f"错误: 记录 {record_index} 不是 Type 0x04 (直接坐标格式)")
+            return False
+
+        base = rec.marker_offset
+        ep_count = struct.unpack('<H', self.data[base + 34:base + 36])[0]
+
+        if len(new_coords) != ep_count:
+            print(f"错误: 新端点数 {len(new_coords)} != 原始端点数 {ep_count}")
+            return False
+
+        for j, (x, y) in enumerate(new_coords):
+            pos = base + 36 + j * 8
+            self.data[pos:pos + 4] = struct.pack('<I', x & 0xFFFFFFFF)
+            self.data[pos + 4:pos + 8] = struct.pack('<I', y & 0xFFFFFFFF)
+
+        print(f"[端点修改] 记录 {record_index}: "
+              f"{[(f'({x},{y})') for x, y in new_coords]}")
+        return True
+
     def modifyRecordCoordinates(self, record_index: int,
                                  coord_index: int,
                                  new_coords: List[Tuple[int, int]]) -> bool:
         """
         修改指定记录中 uint32 格式的坐标数据
         
-        注意：仅支持修改 uint32 格式的坐标区域，float 格式（画布参数）不可修改。
+        支持以下格式:
+        - 'uint32': Type 0x04 的直接端点坐标（X/Y各4字节）
+        - 'uint32_type01': Type 0x01 的位置参数（每个4字节）
+        
         修改后点数必须与原始点数相同，以保证文件大小不变。
         
         Args:
@@ -813,8 +981,8 @@ class WSDRecordModifier:
             return False
 
         offset, count, fmt = rec.coord_regions[coord_index]
-        if fmt != 'uint32':
-            print(f"错误: 坐标区域 {coord_index} 是 float 格式，不支持修改")
+        if fmt not in ('uint32', 'uint32_type01'):
+            print(f"错误: 坐标区域 {coord_index} 格式 '{fmt}' 不支持修改")
             return False
 
         if len(new_coords) != count:
@@ -822,13 +990,17 @@ class WSDRecordModifier:
                   f"(文件大小不能改变!)")
             return False
 
-        # 逐点写入 uint32 LE 坐标（X: 4字节, Y: 4字节）
-        for j, (x, y) in enumerate(new_coords):
-            pos = offset + j * 8
-            # X 坐标 (uint32 LE)
-            self.data[pos:pos + 4] = struct.pack('<I', x & 0xFFFFFFFF)
-            # Y 坐标 (uint32 LE)
-            self.data[pos + 4:pos + 8] = struct.pack('<I', y & 0xFFFFFFFF)
+        if fmt == 'uint32':
+            # Type 0x04: 逐点写入 X/Y (各4字节 LE)
+            for j, (x, y) in enumerate(new_coords):
+                pos = offset + j * 8
+                self.data[pos:pos + 4] = struct.pack('<I', x & 0xFFFFFFFF)
+                self.data[pos + 4:pos + 8] = struct.pack('<I', y & 0xFFFFFFFF)
+        elif fmt == 'uint32_type01':
+            # Type 0x01: 每个位置参数是单个 uint32
+            for j, (x, y) in enumerate(new_coords):
+                pos = offset + j * 4
+                self.data[pos:pos + 4] = struct.pack('<I', x & 0xFFFFFFFF)
 
         print(f"[坐标修改] 记录 {record_index}, 区域 {coord_index}: "
               f"修改了 {len(new_coords)} 个坐标点")
@@ -902,19 +1074,29 @@ class WSDRecordModifier:
                 'offset': offset,
                 'count': count,
                 'format': fmt,
-                'modifiable': fmt == 'uint32',
+                'modifiable': fmt in ('uint32', 'uint32_type01'),
             })
+
+        # 额外信息
+        extra = {}
+        if rec.record_type == 0x01:
+            extra['rotation_angle'] = self.getRotationAngle(record_index)
+        elif rec.record_type == 0x04:
+            extra['endpoints'] = self.getEndpointCoords(record_index)
 
         return {
             'record_index': record_index,
             'marker_offset': rec.marker_offset,
             'canvas_index': rec.canvas_index,
+            'record_type': rec.record_type,
+            'record_type_name': {0x01: '旋转矩阵', 0x04: '直接坐标'}.get(rec.record_type, f'未知'),
             'color': rec.color.hex(),
             'color_name': color_name,
             'line_width_mm': lw_mm,
             'line_width_raw': rec.line_width_raw,
             'coord_regions': coord_info,
             'record_size': rec.record_size,
+            **extra,
         }
 
 
