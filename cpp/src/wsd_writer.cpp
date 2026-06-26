@@ -227,4 +227,364 @@ bool Writer::writeWithTemplate(
     return (replaced == templateObjects.size());
 }
 
+// ============================================================
+//  颜色索引表定义（已验证）
+// ============================================================
+
+const ColorIndex COLOR_INDEX_TABLE[] = {
+    {"red",   {{0x00, 0x00, 0xff, 0xff}}},
+    {"green", {{0x71, 0xb3, 0x3c, 0xff}}},
+    {"blue",  {{0xf0, 0xb0, 0x00, 0xff}}},
+    {"black", {{0x01, 0xff, 0x00, 0x00}}},
+    {"white", {{0x02, 0xff, 0x00, 0x00}}},
+};
+const size_t COLOR_INDEX_TABLE_SIZE = sizeof(COLOR_INDEX_TABLE) / sizeof(COLOR_INDEX_TABLE[0]);
+
+// ============================================================
+//  记录表修改接口实现
+// ============================================================
+
+bool Writer::findColorByName(const std::string& colorName, std::array<uint8_t, 4>& result) {
+    // 颜色名称查找（不区分大小写）
+    std::string lowerName = colorName;
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+    for (size_t i = 0; i < COLOR_INDEX_TABLE_SIZE; ++i) {
+        if (COLOR_INDEX_TABLE[i].name == lowerName) {
+            result = COLOR_INDEX_TABLE[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Writer::loadRecordFile(const std::string& wsd_path) {
+    // 加载 WSD 文件到 recordData 缓冲区
+    std::ifstream file(wsd_path, std::ios::binary);
+    if (!file) return false;
+
+    recordData.assign(std::istreambuf_iterator<char>(file),
+                       std::istreambuf_iterator<char>());
+    file.close();
+
+    originalSize = recordData.size();
+    records.clear();
+    return !recordData.empty();
+}
+
+bool Writer::parseRecords() {
+    // 解析文件尾部记录表 - 查找所有 0f 33 ff 00 07 标记
+    if (recordData.empty()) return false;
+
+    records.clear();
+    const size_t fileSize = recordData.size();
+
+    // 从文件后半部分开始搜索（记录表通常在文件尾部）
+    const size_t searchStart = (fileSize > 200) ? (fileSize / 2) : 0;
+
+    size_t i = searchStart;
+    while (i + 32 < fileSize) {
+        // 查找记录标记: 0f 33 ff 00 07
+        if (recordData[i] == 0x0f &&
+            recordData[i + 1] == 0x33 &&
+            recordData[i + 2] == 0xff &&
+            recordData[i + 3] == 0x00 &&
+            recordData[i + 4] == 0x07) {
+
+            // 验证字段标记: 04 ff ff (marker+5)
+            if (i + 8 < fileSize &&
+                recordData[i + 5] == 0x04 &&
+                recordData[i + 6] == 0xff &&
+                recordData[i + 7] == 0xff) {
+
+                // 提取颜色索引 (marker+8, 4字节)
+                Record rec;
+                rec.markerOffset = i;
+                rec.canvasIndex = static_cast<int>(records.size());
+                std::copy(recordData.begin() + i + COLOR_OFFSET,
+                          recordData.begin() + i + COLOR_OFFSET + 4,
+                          rec.color.begin());
+
+                // 提取线宽 (marker+16, uint32 LE, 毫米 * 400)
+                if (i + LINEWIDTH_OFFSET + 4 <= fileSize) {
+                    rec.lineWidthRaw = *reinterpret_cast<const uint32_t*>(
+                        recordData.data() + i + LINEWIDTH_OFFSET);
+                } else {
+                    rec.lineWidthRaw = 0;
+                }
+
+                // 解析坐标数据区域 (marker+32 起)
+                rec.coordRegions.clear();
+                size_t pos = i + COORD_DATA_START;
+
+                while (pos + 6 < fileSize) {
+                    // 检测是否到达下一条记录
+                    if (recordData[pos] == 0x0f && pos + 4 < fileSize &&
+                        recordData[pos + 1] == 0x33 &&
+                        recordData[pos + 2] == 0xff) {
+                        break;  // 下一条记录标记
+                    }
+
+                    // 检测 uint32 坐标格式
+                    // 格式: type(2B BE) + header(2B BE) + count(2B BE) + X/Y 对 (各4字节 LE)
+                    uint16_t coordType   = (recordData[pos] << 8) | recordData[pos + 1];
+                    uint16_t coordHeader = (recordData[pos + 2] << 8) | recordData[pos + 3];
+                    uint16_t coordCount  = (recordData[pos + 4] << 8) | recordData[pos + 5];
+
+                    // 合理性检查
+                    if (coordCount > 0 && coordCount <= 50000 &&
+                        coordType > 0 && coordType < 0x0500 &&
+                        coordHeader < 0x1000) {
+
+                        const size_t coordDataSize = static_cast<size_t>(coordCount) * 8;
+                        if (pos + 6 + coordDataSize <= fileSize) {
+                            rec.coordRegions.push_back({
+                                pos + 6,       // 数据偏移
+                                coordCount,    // 点数
+                                true           // uint32 格式（可修改）
+                            });
+                            pos = pos + 6 + coordDataSize;
+                            continue;
+                        }
+                    }
+
+                    // float 格式区域（画布参数）- 跳过，不修改
+                    // 查找下一个结构标记
+                    size_t scanEnd = std::min(pos + 200, fileSize - 4);
+                    size_t floatBytes = 0;
+                    while (pos + floatBytes < scanEnd) {
+                        if (recordData[pos + floatBytes] == 0x0f &&
+                            recordData[pos + floatBytes + 1] == 0x33 &&
+                            recordData[pos + floatBytes + 2] == 0xff) {
+                            break;
+                        }
+                        floatBytes++;
+                    }
+
+                    if (floatBytes > 16) {
+                        // float 区域（画布参数），标记但不可修改
+                        rec.coordRegions.push_back({
+                            pos,
+                            static_cast<uint16_t>(floatBytes / 4),
+                            false  // float 格式（不可修改）
+                        });
+                        pos += floatBytes;
+                    } else {
+                        pos++;
+                    }
+                }
+
+                // 计算记录大小
+                if (!records.empty()) {
+                    rec.recordSize = i - records.back().markerOffset;
+                } else {
+                    // 最后一条（最早发现的）记录，到文件末尾减去校验和(8字节)
+                    rec.recordSize = fileSize - i - 8;
+                }
+
+                records.push_back(rec);
+
+                // 跳过已解析区域
+                i += std::max(rec.recordSize, static_cast<size_t>(32));
+                continue;
+            }
+        }
+        i++;
+    }
+
+    // 按偏移排序（从文件头到尾的顺序）
+    std::sort(records.begin(), records.end(),
+              [](const Record& a, const Record& b) {
+                  return a.markerOffset < b.markerOffset;
+              });
+
+    // 分配画布索引
+    assignCanvasIndices();
+
+    return !records.empty();
+}
+
+void Writer::assignCanvasIndices() {
+    // 分配画布索引：基于记录间距离判断画布边界
+    if (records.size() <= 1) return;
+
+    // 计算相邻记录间距
+    std::vector<size_t> gaps;
+    for (size_t i = 1; i < records.size(); ++i) {
+        gaps.push_back(records[i].markerOffset - records[i - 1].markerOffset);
+    }
+    if (gaps.empty()) return;
+
+    // 使用间距中位数的 3 倍作为画布分隔阈值
+    std::vector<size_t> sortedGaps = gaps;
+    std::sort(sortedGaps.begin(), sortedGaps.end());
+    size_t medianGap = sortedGaps[sortedGaps.size() / 2];
+    size_t threshold = std::max(medianGap * 3, static_cast<size_t>(1000));
+
+    int canvasIdx = 0;
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (i > 0 && gaps[i - 1] > threshold) {
+            canvasIdx++;
+        }
+        records[i].canvasIndex = canvasIdx;
+    }
+}
+
+void Writer::updateTailChecksum() {
+    // 更新文件尾部校验和
+    // 格式: filesize_le32 + ff ff ff ff（共 8 字节）
+    if (recordData.size() < 8) return;
+
+    uint32_t fileSize = static_cast<uint32_t>(recordData.size());
+    recordData[recordData.size() - 8] = static_cast<uint8_t>(fileSize & 0xFF);
+    recordData[recordData.size() - 7] = static_cast<uint8_t>((fileSize >> 8) & 0xFF);
+    recordData[recordData.size() - 6] = static_cast<uint8_t>((fileSize >> 16) & 0xFF);
+    recordData[recordData.size() - 5] = static_cast<uint8_t>((fileSize >> 24) & 0xFF);
+    recordData[recordData.size() - 4] = 0xFF;
+    recordData[recordData.size() - 3] = 0xFF;
+    recordData[recordData.size() - 2] = 0xFF;
+    recordData[recordData.size() - 1] = 0xFF;
+}
+
+bool Writer::modifyRecordColor(size_t recordIndex, const std::array<uint8_t, 4>& newColor) {
+    // 修改指定记录的颜色 (4字节 at marker+8)
+    if (recordIndex >= records.size()) return false;
+
+    Record& rec = records[recordIndex];
+    size_t offset = rec.markerOffset + COLOR_OFFSET;
+
+    if (offset + 4 > recordData.size()) return false;
+
+    std::copy(newColor.begin(), newColor.end(),
+              recordData.begin() + offset);
+    rec.color = newColor;
+
+    return true;
+}
+
+bool Writer::modifyRecordColorByName(size_t recordIndex, const std::string& colorName) {
+    // 通过颜色名称修改记录颜色
+    std::array<uint8_t, 4> colorBytes;
+    if (!findColorByName(colorName, colorBytes)) return false;
+    return modifyRecordColor(recordIndex, colorBytes);
+}
+
+bool Writer::modifyRecordLineWidth(size_t recordIndex, float lineWidthMM) {
+    // 修改指定记录的线宽 (uint32 LE at marker+16, = 毫米 * 400)
+    if (recordIndex >= records.size()) return false;
+
+    Record& rec = records[recordIndex];
+    size_t offset = rec.markerOffset + LINEWIDTH_OFFSET;
+
+    if (offset + 4 > recordData.size()) return false;
+
+    uint32_t lwRaw = static_cast<uint32_t>(lineWidthMM * 400.0f);
+    recordData[offset]     = static_cast<uint8_t>(lwRaw & 0xFF);
+    recordData[offset + 1] = static_cast<uint8_t>((lwRaw >> 8) & 0xFF);
+    recordData[offset + 2] = static_cast<uint8_t>((lwRaw >> 16) & 0xFF);
+    recordData[offset + 3] = static_cast<uint8_t>((lwRaw >> 24) & 0xFF);
+    rec.lineWidthRaw = lwRaw;
+
+    return true;
+}
+
+bool Writer::modifyRecordCoordinates(
+    size_t recordIndex,
+    size_t coordIndex,
+    const std::vector<std::pair<uint32_t, uint32_t>>& newCoords)
+{
+    // 修改指定记录中 uint32 格式的坐标数据
+    // 仅支持 uint32 格式，float 格式不可修改
+    // 点数必须与原始相同以保证文件大小不变
+
+    if (recordIndex >= records.size()) return false;
+
+    Record& rec = records[recordIndex];
+    if (coordIndex >= rec.coordRegions.size()) return false;
+
+    const CoordRegion& region = rec.coordRegions[coordIndex];
+    if (!region.isUint32) return false;  // float 格式不可修改
+
+    if (newCoords.size() != region.count) return false;  // 点数必须匹配
+
+    // 逐点写入 uint32 LE 坐标 (X: 4字节, Y: 4字节)
+    for (size_t j = 0; j < newCoords.size(); ++j) {
+        size_t pos = region.offset + j * 8;
+
+        if (pos + 8 > recordData.size()) return false;
+
+        // X 坐标 (uint32 LE)
+        uint32_t x = newCoords[j].first;
+        recordData[pos]     = static_cast<uint8_t>(x & 0xFF);
+        recordData[pos + 1] = static_cast<uint8_t>((x >> 8) & 0xFF);
+        recordData[pos + 2] = static_cast<uint8_t>((x >> 16) & 0xFF);
+        recordData[pos + 3] = static_cast<uint8_t>((x >> 24) & 0xFF);
+
+        // Y 坐标 (uint32 LE)
+        uint32_t y = newCoords[j].second;
+        recordData[pos + 4] = static_cast<uint8_t>(y & 0xFF);
+        recordData[pos + 5] = static_cast<uint8_t>((y >> 8) & 0xFF);
+        recordData[pos + 6] = static_cast<uint8_t>((y >> 16) & 0xFF);
+        recordData[pos + 7] = static_cast<uint8_t>((y >> 24) & 0xFF);
+    }
+
+    return true;
+}
+
+const Record* Writer::getRecordInfo(size_t recordIndex) const {
+    // 获取指定记录的详细信息
+    if (recordIndex >= records.size()) return nullptr;
+    return &records[recordIndex];
+}
+
+bool Writer::modifyWSD(
+    const std::string& templatePath,
+    const std::string& outputPath,
+    const std::vector<Modification>& modifications)
+{
+    // WSD 文件修改主函数
+    // 1. 加载模板文件
+    if (!loadRecordFile(templatePath)) return false;
+
+    // 2. 解析记录表
+    if (!parseRecords()) return false;
+
+    // 3. 应用所有修改指令
+    for (const auto& mod : modifications) {
+        size_t ri = static_cast<size_t>(mod.recordIndex);
+
+        // 颜色修改
+        if (mod.changeColor && ri < records.size()) {
+            modifyRecordColor(ri, mod.newColor);
+        }
+
+        // 线宽修改
+        if (mod.changeLineWidth && ri < records.size()) {
+            modifyRecordLineWidth(ri, mod.lineWidthMM);
+        }
+
+        // 坐标修改
+        if (mod.changeCoords && ri < records.size()) {
+            size_t ci = static_cast<size_t>(mod.coordIndex);
+            modifyRecordCoordinates(ri, ci, mod.newCoords);
+        }
+    }
+
+    // 4. 校验文件大小（关键要求：必须与原始文件大小相同！）
+    if (recordData.size() != originalSize) {
+        return false;  // 严重错误：文件大小改变会导致 EduEditor 无法打开
+    }
+
+    // 5. 更新尾部校验和
+    updateTailChecksum();
+
+    // 6. 写入输出文件
+    std::ofstream out(outputPath, std::ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(recordData.data()), recordData.size());
+    out.close();
+
+    return true;
+}
+
 } // namespace wsd

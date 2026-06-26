@@ -32,6 +32,33 @@ class WSDObject:
     is_closed: bool = False
 
 
+# ============================================================
+#  已验证的逆向工程常量 - WSD 记录表格式
+# ============================================================
+
+# 记录表标记: 0f 33 ff 00 07（5字节），位于文件尾部
+RECORD_MARKER = bytes([0x0f, 0x33, 0xff, 0x00, 0x07])
+# 字段标记: 04 ff ff（3字节），紧随记录标记之后
+FIELD_MARKER = bytes([0x04, 0xff, 0xff])
+
+# 颜色索引映射表（已验证）
+COLOR_INDEX_MAP = {
+    'red':    bytes([0x00, 0x00, 0xff, 0xff]),
+    'green':  bytes([0x71, 0xb3, 0x3c, 0xff]),
+    'blue':   bytes([0xf0, 0xb0, 0x00, 0xff]),
+    'black':  bytes([0x01, 0xff, 0x00, 0x00]),
+    'white':  bytes([0x02, 0xff, 0x00, 0x00]),
+}
+# 反向映射：4字节颜色索引 -> 颜色名
+COLOR_INDEX_REVERSE = {v: k for k, v in COLOR_INDEX_MAP.items()}
+
+# 记录表结构中各字段相对于标记的偏移量
+COLOR_OFFSET     = 8    # 颜色索引: marker+8，4字节
+PADDING_OFFSET   = 12   # 填充: marker+12，4字节 (00 00 00 00)
+LINEWIDTH_OFFSET = 16   # 线宽: marker+16，uint32 LE (毫米 * 400)
+COORD_DATA_START = 32   # 坐标数据起始: marker+32
+
+
 class WSDTemplateParser:
     """WSD 模板文件解析器 - 提取矢量对象的坐标区域信息"""
 
@@ -470,6 +497,505 @@ def resample_points(points: List[Tuple[float, float]], target_count: int) -> Lis
         result.append((x, y))
 
     return result
+
+
+# ============================================================
+#  WSD 记录表修改器 - 基于逆向工程的记录表结构
+# ============================================================
+
+@dataclass
+class WSDRecord:
+    """单个 WSD 记录（文件尾部记录表中的一条记录）"""
+    marker_offset: int      # 记录标记 (0f 33 ff 00 07) 在文件中的绝对偏移
+    canvas_index: int       # 所属画布索引（支持多画布）
+    color: bytes             # 4字节颜色索引
+    line_width_raw: int     # uint32 LE 线宽原始值（毫米 * 400）
+    coord_regions: List     # 坐标区域列表: [(offset, count, fmt), ...]
+                            #   fmt: 'uint32' 或 'float'
+    record_size: int        # 记录总大小（从标记到下一条记录或尾部）
+
+
+class WSDRecordModifier:
+    """
+    WSD 记录表修改器
+    
+    基于逆向工程验证的记录表格式，可以：
+    - 解析文件尾部的记录表（查找 0f 33 ff 00 07 标记）
+    - 修改记录的颜色、线宽、uint32 坐标
+    - 支持多画布文件
+    - 保持文件大小不变（关键要求！）
+    
+    记录表位于文件尾部，每条记录以 0f 33 ff 00 07 标记开始。
+    文件末尾有校验和: filesize_le32 + ff ff ff ff
+    """
+
+    def __init__(self, wsd_path: str):
+        """
+        加载 WSD 文件
+        
+        Args:
+            wsd_path: WSD 文件路径
+        """
+        self.wsd_path = wsd_path
+        with open(wsd_path, 'rb') as f:
+            self.data = bytearray(f.read())
+        self.original_size = len(self.data)
+        self.records: List[WSDRecord] = []
+        self._parsed = False
+
+    def parseRecords(self) -> List[WSDRecord]:
+        """
+        解析记录表 - 在文件尾部查找所有 0f 33 ff 00 07 标记
+        
+        返回找到的记录列表。每条记录包含标记偏移、颜色、线宽等信息。
+        支持多画布文件（每条记录关联一个画布索引）。
+        """
+        self.records = []
+        data = self.data
+        file_size = len(data)
+
+        # 从文件尾部向前搜索记录标记
+        # 记录表通常从文件尾部约 1/4 处开始
+        search_start = max(0, file_size - file_size // 2)
+
+        i = search_start
+        while i < file_size - 32:  # 至少留 32 字节给记录头
+            # 查找记录标记: 0f 33 ff 00 07
+            if (data[i] == 0x0f and data[i + 1] == 0x33 and
+                data[i + 2] == 0xff and data[i + 3] == 0x00 and
+                data[i + 4] == 0x07):
+
+                # 验证字段标记: 04 ff ff 在 marker+5
+                if (i + 8 < file_size and
+                    data[i + 5] == 0x04 and data[i + 6] == 0xff and
+                    data[i + 7] == 0xff):
+
+                    # 提取颜色索引 (marker+8, 4字节)
+                    color = bytes(data[i + COLOR_OFFSET:i + COLOR_OFFSET + 4])
+
+                    # 提取线宽 (marker+16, uint32 LE, 毫米 * 400)
+                    if i + LINEWIDTH_OFFSET + 4 <= file_size:
+                        lw_raw = struct.unpack('<I', data[i + LINEWIDTH_OFFSET:i + LINEWIDTH_OFFSET + 4])[0]
+                    else:
+                        lw_raw = 0
+
+                    # 解析坐标数据区域 (marker+32 起)
+                    coord_regions = []
+                    pos = i + COORD_DATA_START
+                    canvas_idx = len(self.records)  # 默认画布索引
+
+                    while pos < file_size - 8:
+                        # 检测是否到达下一条记录或文件尾部
+                        if (data[pos] == 0x0f and pos + 4 < file_size and
+                            data[pos + 1] == 0x33 and data[pos + 2] == 0xff):
+                            break  # 下一条记录标记
+
+                        # 检测 uint32 坐标格式
+                        # 格式: type(2B) + header(2B) + count(2B) + X/Y 对 (每对 4+4=8 字节)
+                        if pos + 6 <= file_size:
+                            coord_type = struct.unpack('>H', data[pos:pos + 2])[0]
+                            coord_header = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+                            coord_count = struct.unpack('>H', data[pos + 4:pos + 6])[0]
+
+                            # 合理性检查: count 不超过 50000，type 和 header 在合理范围
+                            if (1 <= coord_count <= 50000 and
+                                0 < coord_type < 0x0500 and
+                                coord_header < 0x1000):
+
+                                coord_data_size = coord_count * 8  # 每个坐标对 8 字节 (X: 4B, Y: 4B)
+                                if pos + 6 + coord_data_size <= file_size:
+                                    coord_regions.append((
+                                        pos + 6,      # 数据起始偏移
+                                        coord_count,  # 坐标点数
+                                        'uint32'       # 格式类型
+                                    ))
+                                    pos = pos + 6 + coord_data_size
+                                    continue
+
+                        # 如果不匹配 uint32 格式，尝试检测 float 格式（bounding box + transform）
+                        # float 格式用于画布参数，不修改，跳过
+                        # 通常有较大的连续 float 区域
+                        float_bytes = 0
+                        scan_end = min(pos + 200, file_size)
+                        while pos + float_bytes < scan_end:
+                            next_byte = data[pos + float_bytes]
+                            # 检测下一个结构标记
+                            if (next_byte == 0x0f and
+                                pos + float_bytes + 4 < file_size and
+                                data[pos + float_bytes + 1] == 0x33):
+                                break
+                            float_bytes += 1
+
+                        if float_bytes > 16:
+                            # 可能是 float 坐标区域（画布参数），标记但不修改
+                            coord_regions.append((pos, float_bytes // 4, 'float'))
+                            pos += float_bytes
+                        else:
+                            pos += 1
+
+                    # 计算记录大小
+                    if self.records:
+                        prev = self.records[-1]
+                        record_size = i - prev.marker_offset
+                    else:
+                        # 对于最后一条（最早发现的）记录，计算到文件末尾
+                        # 需要减去尾部校验和 (8字节: filesize_le32 + ffffffff)
+                        record_size = file_size - i - 8
+
+                    record = WSDRecord(
+                        marker_offset=i,
+                        canvas_index=canvas_idx,
+                        color=color,
+                        line_width_raw=lw_raw,
+                        coord_regions=coord_regions,
+                        record_size=record_size,
+                    )
+                    self.records.append(record)
+
+                    # 跳过已解析的记录区域
+                    i += max(record_size, 32)
+                    continue
+
+            i += 1
+
+        # 按偏移排序（从文件头到尾的顺序）
+        self.records.sort(key=lambda r: r.marker_offset)
+
+        # 分配画布索引：基于记录间的间隔判断画布边界
+        self._assign_canvas_indices()
+
+        self._parsed = True
+        print(f"[记录表解析] 找到 {len(self.records)} 条记录")
+        for idx, rec in enumerate(self.records):
+            color_name = COLOR_INDEX_REVERSE.get(rec.color, f'{rec.color.hex()}')
+            lw_mm = rec.line_width_raw / 400.0 if rec.line_width_raw else 0
+            print(f"  记录 {idx}: 画布={rec.canvas_index}, "
+                  f"偏移=0x{rec.marker_offset:x}, "
+                  f"颜色={color_name}, "
+                  f"线宽={lw_mm:.2f}mm, "
+                  f"坐标区域={len(rec.coord_regions)}个")
+
+        return self.records
+
+    def _assign_canvas_indices(self):
+        """
+        分配画布索引
+        
+        根据记录间的距离判断是否属于同一画布。
+        同一画布的记录通常紧密排列，不同画布之间有较大间隔。
+        """
+        if len(self.records) <= 1:
+            return
+
+        # 计算相邻记录间距
+        gaps = []
+        for i in range(1, len(self.records)):
+            gap = self.records[i].marker_offset - self.records[i - 1].marker_offset
+            gaps.append(gap)
+
+        if not gaps:
+            return
+
+        # 使用间距中位数的 3 倍作为画布分隔阈值
+        median_gap = sorted(gaps)[len(gaps) // 2]
+        threshold = max(median_gap * 3, 1000)  # 至少 1000 字节
+
+        canvas_idx = 0
+        for i, rec in enumerate(self.records):
+            if i > 0 and gaps[i - 1] > threshold:
+                canvas_idx += 1
+            rec.canvas_index = canvas_idx
+
+    def modifyRecordColor(self, record_index: int, new_color: bytes) -> bool:
+        """
+        修改指定记录的颜色
+        
+        Args:
+            record_index: 记录索引（0-based）
+            new_color: 4字节颜色索引，如 COLOR_INDEX_MAP['red']
+        
+        Returns:
+            成功返回 True
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            print(f"错误: 记录索引 {record_index} 超出范围 (0~{len(self.records) - 1})")
+            return False
+
+        if len(new_color) != 4:
+            print("错误: 颜色必须是 4 字节")
+            return False
+
+        rec = self.records[record_index]
+        offset = rec.marker_offset + COLOR_OFFSET
+        self.data[offset:offset + 4] = new_color
+        rec.color = new_color
+
+        color_name = COLOR_INDEX_REVERSE.get(new_color, f'{new_color.hex()}')
+        print(f"[颜色修改] 记录 {record_index}: 颜色 -> {color_name}")
+        return True
+
+    def modifyRecordColorByName(self, record_index: int, color_name: str) -> bool:
+        """
+        通过颜色名称修改记录颜色
+        
+        Args:
+            record_index: 记录索引
+            color_name: 颜色名称 ('red', 'green', 'blue', 'black', 'white')
+        
+        Returns:
+            成功返回 True
+        """
+        if color_name.lower() not in COLOR_INDEX_MAP:
+            print(f"错误: 未知颜色 '{color_name}'，可选: {list(COLOR_INDEX_MAP.keys())}")
+            return False
+
+        return self.modifyRecordColor(record_index, COLOR_INDEX_MAP[color_name.lower()])
+
+    def modifyRecordLineWidth(self, record_index: int, line_width_mm: float) -> bool:
+        """
+        修改指定记录的线宽
+        
+        Args:
+            record_index: 记录索引
+            line_width_mm: 线宽（毫米），将转换为 uint32 LE (毫米 * 400)
+        
+        Returns:
+            成功返回 True
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            print(f"错误: 记录索引 {record_index} 超出范围 (0~{len(self.records) - 1})")
+            return False
+
+        rec = self.records[record_index]
+        lw_raw = int(line_width_mm * 400)
+        offset = rec.marker_offset + LINEWIDTH_OFFSET
+
+        # 写入 uint32 LE 线宽值
+        self.data[offset:offset + 4] = struct.pack('<I', lw_raw)
+        rec.line_width_raw = lw_raw
+
+        print(f"[线宽修改] 记录 {record_index}: 线宽 -> {line_width_mm:.2f}mm (raw={lw_raw})")
+        return True
+
+    def modifyRecordCoordinates(self, record_index: int,
+                                 coord_index: int,
+                                 new_coords: List[Tuple[int, int]]) -> bool:
+        """
+        修改指定记录中 uint32 格式的坐标数据
+        
+        注意：仅支持修改 uint32 格式的坐标区域，float 格式（画布参数）不可修改。
+        修改后点数必须与原始点数相同，以保证文件大小不变。
+        
+        Args:
+            record_index: 记录索引
+            coord_index: 坐标区域索引（一条记录可能有多个坐标区域）
+            new_coords: 新坐标列表 [(x, y), ...]，每个坐标为 uint32
+        
+        Returns:
+            成功返回 True
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            print(f"错误: 记录索引 {record_index} 超出范围")
+            return False
+
+        rec = self.records[record_index]
+        if coord_index < 0 or coord_index >= len(rec.coord_regions):
+            print(f"错误: 坐标区域索引 {coord_index} 超出范围 (0~{len(rec.coord_regions) - 1})")
+            return False
+
+        offset, count, fmt = rec.coord_regions[coord_index]
+        if fmt != 'uint32':
+            print(f"错误: 坐标区域 {coord_index} 是 float 格式，不支持修改")
+            return False
+
+        if len(new_coords) != count:
+            print(f"错误: 新坐标数 {len(new_coords)} != 原始坐标数 {count} "
+                  f"(文件大小不能改变!)")
+            return False
+
+        # 逐点写入 uint32 LE 坐标（X: 4字节, Y: 4字节）
+        for j, (x, y) in enumerate(new_coords):
+            pos = offset + j * 8
+            # X 坐标 (uint32 LE)
+            self.data[pos:pos + 4] = struct.pack('<I', x & 0xFFFFFFFF)
+            # Y 坐标 (uint32 LE)
+            self.data[pos + 4:pos + 8] = struct.pack('<I', y & 0xFFFFFFFF)
+
+        print(f"[坐标修改] 记录 {record_index}, 区域 {coord_index}: "
+              f"修改了 {len(new_coords)} 个坐标点")
+        return True
+
+    def _update_tail_checksum(self):
+        """
+        更新文件尾部校验和
+        
+        校验和格式: filesize_le32 + ff ff ff ff（共 8 字节）
+        位于文件最后 8 字节。
+        """
+        # 写入文件大小 (uint32 LE)
+        file_size = len(self.data)
+        self.data[-8:-4] = struct.pack('<I', file_size)
+        # 校验标记 ff ff ff ff
+        self.data[-4:] = b'\xff\xff\xff\xff'
+
+    def save(self, output_path: str) -> bool:
+        """
+        保存修改后的 WSD 文件
+        
+        关键要求: 文件大小必须与原始文件完全相同！
+        
+        Args:
+            output_path: 输出文件路径
+        
+        Returns:
+            成功返回 True
+        """
+        if len(self.data) != self.original_size:
+            print(f"严重错误: 文件大小已改变! "
+                  f"原始={self.original_size}, 当前={len(self.data)}")
+            print("这会导致 EduEditor 无法打开文件!")
+            return False
+
+        # 更新尾部校验和
+        self._update_tail_checksum()
+
+        with open(output_path, 'wb') as f:
+            f.write(self.data)
+
+        print(f"[保存] 输出文件: {output_path} "
+              f"(大小: {len(self.data)} 字节, 与原始一致: {len(self.data) == self.original_size})")
+        return True
+
+    def get_record_info(self, record_index: int) -> Optional[dict]:
+        """
+        获取指定记录的详细信息
+        
+        Args:
+            record_index: 记录索引
+        
+        Returns:
+            记录信息字典，索引无效返回 None
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        if record_index < 0 or record_index >= len(self.records):
+            return None
+
+        rec = self.records[record_index]
+        color_name = COLOR_INDEX_REVERSE.get(rec.color, rec.color.hex())
+        lw_mm = rec.line_width_raw / 400.0 if rec.line_width_raw else 0
+
+        coord_info = []
+        for ci, (offset, count, fmt) in enumerate(rec.coord_regions):
+            coord_info.append({
+                'index': ci,
+                'offset': offset,
+                'count': count,
+                'format': fmt,
+                'modifiable': fmt == 'uint32',
+            })
+
+        return {
+            'record_index': record_index,
+            'marker_offset': rec.marker_offset,
+            'canvas_index': rec.canvas_index,
+            'color': rec.color.hex(),
+            'color_name': color_name,
+            'line_width_mm': lw_mm,
+            'line_width_raw': rec.line_width_raw,
+            'coord_regions': coord_info,
+            'record_size': rec.record_size,
+        }
+
+
+def wsd_modify(wsd_path: str, output_path: str,
+               color_changes: Optional[dict] = None,
+               linewidth_changes: Optional[dict] = None,
+               coord_changes: Optional[dict] = None) -> bool:
+    """
+    WSD 文件修改主函数
+    
+    基于逆向工程的记录表结构，对 WSD 文件进行精确修改。
+    支持颜色、线宽、坐标的修改，且保持文件大小不变。
+    
+    Args:
+        wsd_path: 输入 WSD 文件路径
+        output_path: 输出 WSD 文件路径
+        color_changes: 颜色修改字典 {记录索引: 颜色名或4字节}
+            示例: {0: 'red', 1: 'blue', 2: bytes([0x00, 0x00, 0xff, 0xff])}
+        linewidth_changes: 线宽修改字典 {记录索引: 线宽毫米}
+            示例: {0: 0.5, 1: 2.0}
+        coord_changes: 坐标修改字典 {(记录索引, 区域索引): [(x,y), ...]}
+            示例: {(0, 0): [(100, 200), (300, 400), ...]}
+            注意: 新坐标数必须与原始点数完全相同!
+    
+    Returns:
+        成功返回 True
+    
+    使用示例:
+        # 修改颜色
+        wsd_modify('input.wsd', 'output.wsd', color_changes={0: 'red', 1: 'blue'})
+        
+        # 修改线宽
+        wsd_modify('input.wsd', 'output.wsd', linewidth_changes={0: 0.5})
+        
+        # 修改坐标 + 颜色
+        wsd_modify('input.wsd', 'output.wsd',
+                   color_changes={0: 'green'},
+                   coord_changes={(0, 0): [(100, 200), (300, 400)]})
+    """
+    print(f"=== WSD 记录修改器 ===")
+    print(f"输入: {wsd_path}")
+    print(f"输出: {output_path}")
+
+    # 初始化修改器并解析记录表
+    modifier = WSDRecordModifier(wsd_path)
+    modifier.parseRecords()
+
+    if not modifier.records:
+        print("错误: 未找到任何记录标记 (0f 33 ff 00 07)")
+        return False
+
+    # 应用颜色修改
+    if color_changes:
+        print(f"\n[应用颜色修改] {len(color_changes)} 条")
+        for rec_idx, color in color_changes.items():
+            if isinstance(color, str):
+                modifier.modifyRecordColorByName(rec_idx, color)
+            elif isinstance(color, (bytes, bytearray)) and len(color) == 4:
+                modifier.modifyRecordColor(rec_idx, bytes(color))
+            else:
+                print(f"  警告: 跳过无效颜色指定: 记录 {rec_idx}, 类型={type(color)}")
+
+    # 应用线宽修改
+    if linewidth_changes:
+        print(f"\n[应用线宽修改] {len(linewidth_changes)} 条")
+        for rec_idx, lw_mm in linewidth_changes.items():
+            modifier.modifyRecordLineWidth(rec_idx, lw_mm)
+
+    # 应用坐标修改
+    if coord_changes:
+        print(f"\n[应用坐标修改] {len(coord_changes)} 条")
+        for (rec_idx, coord_idx), coords in coord_changes.items():
+            modifier.modifyRecordCoordinates(rec_idx, coord_idx, coords)
+
+    # 保存（自动校验文件大小 + 更新尾部校验和）
+    success = modifier.save(output_path)
+
+    if success:
+        print(f"\n完成! 输出文件: {output_path}")
+        print(f"请用 EduEditor 打开验证。")
+    return success
 
 
 def svg_to_wsd(template_path: str, svg_path: str, output_path: str):
