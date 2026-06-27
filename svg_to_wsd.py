@@ -38,8 +38,12 @@ class WSDObject:
 
 # 记录表标记: 0f 33 ff 00 07（5字节），位于文件尾部
 RECORD_MARKER = bytes([0x0f, 0x33, 0xff, 0x00, 0x07])
+# 记录表标记变体: 0f 33 cf 10 07（用于填充等带装饰效果的记录）
+RECORD_MARKER_FILL = bytes([0x0f, 0x33, 0xcf, 0x10, 0x07])
 # 字段标记: 04 ff ff（3字节），紧随记录标记之后
 FIELD_MARKER = bytes([0x04, 0xff, 0xff])
+# 字段标记变体: 84 ff ff（3字节，用于填充控制记录）
+FIELD_MARKER_FILL = bytes([0x84, 0xff, 0xff])
 
 # 颜色索引映射表（已验证）
 COLOR_INDEX_MAP = {
@@ -548,8 +552,10 @@ def resample_points(points: List[Tuple[float, float]], target_count: int) -> Lis
 
 @dataclass
 class WSDRecord:
-    """单个 WSD 记录（文件尾部记录表中的一条线段 sub-record）"""
-    marker_offset: int      # 记录标记 (0f 33 ff 00 07) 在文件中的绝对偏移
+    """单个 WSD 记录（文件尾部记录表中的一条线段/填充 sub-record）"""
+    marker_offset: int      # 记录标记在文件中的绝对偏移
+                            # 标准标记: 0f 33 ff 00 07
+                            # 填充标记: 0f 33 cf 10 07
     canvas_index: int       # 所属画布索引（支持多画布）
     color: bytes             # 4字节颜色索引
     line_width_raw: int     # uint32 LE 线宽原始值（毫米 * 400）
@@ -613,14 +619,18 @@ class WSDRecordModifier:
 
     def parseRecords(self) -> List[WSDRecord]:
         """
-        解析记录表 - 在文件尾部查找所有 0f 33 ff 00 07 标记
+        解析记录表 - 在文件尾部查找记录标记
         
-        识别两种 sub-record 类型:
+        支持两种标记格式:
+          - 标准标记: 0f 33 ff 00 07（字段标记 04 ff ff）
+          - 填充标记: 0f 33 cf 10 07（字段标记 84 ff ff 或 04 ff ff）
+        
+        识别 sub-record 类型:
           - Type 0x01: 旋转矩阵格式（77字节，含方向角cos/sin编码）
           - Type 0x04: 直接坐标格式（53字节，含uint32端点 x1,y1,x2,y2）
+          - Fill: 填充控制记录（含填充颜色/图案参数）
         
-        返回找到的记录列表。每条记录包含标记偏移、颜色、线宽、类型等信息。
-        支持多画布文件（每条记录关联一个画布索引）。
+        返回找到的记录列表。支持多画布文件。
         """
         self.records = []
         data = self.data
@@ -629,17 +639,22 @@ class WSDRecordModifier:
         # 从文件后半部分搜索记录标记
         search_start = max(0, file_size - file_size // 2)
 
-        # 第一遍：找到所有标记位置
+        # 第一遍：找到所有标记位置（标准 + 填充变体）
         markers = []
         i = search_start
         while i < file_size - 32:
-            if (data[i] == 0x0f and data[i + 1] == 0x33 and
-                data[i + 2] == 0xff and data[i + 3] == 0x00 and
-                data[i + 4] == 0x07):
-                # 验证字段标记: 04 ff ff
-                if (i + 8 < file_size and
-                    data[i + 5] == 0x04 and data[i + 6] == 0xff and
-                    data[i + 7] == 0xff):
+            if data[i] == 0x0f and data[i + 1] == 0x33 and data[i + 4] == 0x07:
+                # 标准: 0f 33 ff 00 07 + 04 ff ff
+                is_standard = (data[i + 2] == 0xff and data[i + 3] == 0x00 and
+                              i + 8 < file_size and
+                              data[i + 5] == 0x04 and data[i + 6] == 0xff and
+                              data[i + 7] == 0xff)
+                # 填充变体: 0f 33 cf 10 07 + 84 ff ff 或 04 ff ff
+                is_fill = (data[i + 2] == 0xcf and data[i + 3] == 0x10 and
+                           i + 8 < file_size and
+                           (data[i + 5] == 0x84 or data[i + 5] == 0x04) and
+                           data[i + 6] == 0xff and data[i + 7] == 0xff)
+                if is_standard or is_fill:
                     markers.append(i)
             i += 1
 
