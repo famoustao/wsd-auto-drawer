@@ -459,7 +459,116 @@ bool Writer::parseRecords() {
     // 分配画布索引
     assignCanvasIndices();
 
+    // 解析画布 pre-record 区域
+    parseCanvasPreRecords();
+
     return !records.empty();
+}
+
+void Writer::parseCanvasPreRecords() {
+    // 解析每个画布的 pre-record 区域位置
+    // pre-record 位于画布第一条记录标记之前 40 字节处（基于 2000.wsd 验证）
+    canvases.clear();
+    if (records.empty()) return;
+
+    int maxCanvasIdx = 0;
+    for (const auto& rec : records) {
+        if (rec.canvasIndex > maxCanvasIdx) maxCanvasIdx = rec.canvasIndex;
+    }
+
+    for (int canvasIdx = 0; canvasIdx <= maxCanvasIdx; ++canvasIdx) {
+        const Record* firstRec = nullptr;
+        size_t firstRecIdx = 0;
+        for (size_t i = 0; i < records.size(); ++i) {
+            if (records[i].canvasIndex == canvasIdx) {
+                firstRec = &records[i];
+                firstRecIdx = i;
+                break;
+            }
+        }
+        if (!firstRec) continue;
+
+        // pre-record 在第一个记录标记前 40 字节 (0x28)
+        size_t preOffset = firstRec->markerOffset - 40;
+        if (preOffset + 8 > recordData.size()) continue;
+
+        canvases.push_back({canvasIdx, preOffset, firstRecIdx});
+    }
+}
+
+std::array<uint16_t, 4> Writer::readPreRecord(size_t offset) const {
+    // 读取 pre-record 区域的 4 个 uint16 LE 值
+    std::array<uint16_t, 4> result;
+    result[0] = static_cast<uint16_t>(recordData[offset] | (recordData[offset + 1] << 8));
+    result[1] = static_cast<uint16_t>(recordData[offset + 2] | (recordData[offset + 3] << 8));
+    result[2] = static_cast<uint16_t>(recordData[offset + 4] | (recordData[offset + 5] << 8));
+    result[3] = static_cast<uint16_t>(recordData[offset + 6] | (recordData[offset + 7] << 8));
+    return result;
+}
+
+bool Writer::getCanvasPreRecord(int canvasIndex, std::array<uint16_t, 4>& fields) const {
+    for (const auto& cvs : canvases) {
+        if (cvs.canvasIndex == canvasIndex) {
+            fields = readPreRecord(cvs.preRecordOffset);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Writer::modifyCanvasPreRecord(int canvasIndex,
+                                    const uint16_t* field0,
+                                    const uint16_t* field1,
+                                    const uint16_t* field2,
+                                    const uint16_t* field3) {
+    const Canvas* target = nullptr;
+    for (const auto& c : canvases) {
+        if (c.canvasIndex == canvasIndex) {
+            target = &c;
+            break;
+        }
+    }
+    if (!target) return false;
+
+    size_t offset = target->preRecordOffset;
+    auto oldVals = readPreRecord(offset);
+    auto newVals = oldVals;
+
+    if (field0) newVals[0] = *field0;
+    if (field1) newVals[1] = *field1;
+    if (field2) newVals[2] = *field2;
+    if (field3) newVals[3] = *field3;
+
+    recordData[offset]     = static_cast<uint8_t>(newVals[0] & 0xFF);
+    recordData[offset + 1] = static_cast<uint8_t>((newVals[0] >> 8) & 0xFF);
+    recordData[offset + 2] = static_cast<uint8_t>(newVals[1] & 0xFF);
+    recordData[offset + 3] = static_cast<uint8_t>((newVals[1] >> 8) & 0xFF);
+    recordData[offset + 4] = static_cast<uint8_t>(newVals[2] & 0xFF);
+    recordData[offset + 5] = static_cast<uint8_t>((newVals[2] >> 8) & 0xFF);
+    recordData[offset + 6] = static_cast<uint8_t>(newVals[3] & 0xFF);
+    recordData[offset + 7] = static_cast<uint8_t>((newVals[3] >> 8) & 0xFF);
+
+    return true;
+}
+
+bool Writer::moveCanvasBy(int canvasIndex, int dx, int dy,
+                           int dxField, int dyField) {
+    std::array<uint16_t, 4> pre;
+    if (!getCanvasPreRecord(canvasIndex, pre)) return false;
+
+    std::array<uint16_t, 4> newVals = pre;
+    if (dxField >= 0 && dxField < 4) {
+        int val = static_cast<int>(pre[dxField]) + dx;
+        newVals[dxField] = static_cast<uint16_t>(val & 0xFFFF);
+    }
+    if (dyField >= 0 && dyField < 4) {
+        int val = static_cast<int>(pre[dyField]) + dy;
+        newVals[dyField] = static_cast<uint16_t>(val & 0xFFFF);
+    }
+
+    return modifyCanvasPreRecord(canvasIndex,
+                                  &newVals[0], &newVals[1],
+                                  &newVals[2], &newVals[3]);
 }
 
 void Writer::assignCanvasIndices() {

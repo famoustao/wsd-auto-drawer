@@ -559,6 +559,14 @@ class WSDRecord:
     record_size: int        # 记录总大小（从标记到下一条记录或公共尾部）
 
 
+@dataclass
+class WSDCanvas:
+    """WSD 画布（一个画布包含多条线段记录）"""
+    canvas_index: int       # 画布索引
+    pre_record_offset: int  # pre-record 区域在文件中的绝对偏移（8字节）
+    first_record_idx: int   # 该画布的第一条记录索引
+
+
 class WSDRecordModifier:
     """
     WSD 记录表修改器
@@ -600,6 +608,7 @@ class WSDRecordModifier:
             self.data = bytearray(f.read())
         self.original_size = len(self.data)
         self.records: List[WSDRecord] = []
+        self.canvases: List[WSDCanvas] = []
         self._parsed = False
 
     def parseRecords(self) -> List[WSDRecord]:
@@ -723,8 +732,11 @@ class WSDRecordModifier:
         # 分配画布索引：基于记录间的间隔判断画布边界
         self._assign_canvas_indices()
 
+        # 解析画布 pre-record 区域
+        self._parse_canvas_pre_records()
+
         self._parsed = True
-        print(f"[记录表解析] 找到 {len(self.records)} 条记录")
+        print(f"[记录表解析] 找到 {len(self.records)} 条记录, {len(self.canvases)} 个画布")
         for idx, rec in enumerate(self.records):
             color_name = COLOR_INDEX_REVERSE.get(rec.color, f'{rec.color.hex()}')
             lw_mm = rec.line_width_raw / 400.0 if rec.line_width_raw else 0
@@ -735,8 +747,162 @@ class WSDRecordModifier:
                   f"颜色={color_name}, "
                   f"线宽={lw_mm:.2f}mm, "
                   f"坐标区域={len(rec.coord_regions)}个")
+        for cvs in self.canvases:
+            pre = self._read_pre_record(cvs.pre_record_offset)
+            print(f"  画布 {cvs.canvas_index}: pre-record偏移=0x{cvs.pre_record_offset:x}, "
+                  f"字段=[{pre[0]}, {pre[1]}, {pre[2]}, {pre[3]}]")
 
         return self.records
+
+    def _parse_canvas_pre_records(self):
+        """
+        解析每个画布的 pre-record 区域位置
+        
+        pre-record 位于画布第一条记录标记之前 40 字节处（基于 2000.wsd 验证）。
+        每个画布对应一个 8 字节的 pre-record 区域，控制该画布上 Type 0x01 记录的位置。
+        """
+        self.canvases = []
+        if not self.records:
+            return
+
+        max_canvas_idx = max(r.canvas_index for r in self.records)
+        for canvas_idx in range(max_canvas_idx + 1):
+            canvas_records = [r for r in self.records if r.canvas_index == canvas_idx]
+            if not canvas_records:
+                continue
+            first_rec = canvas_records[0]
+            # pre-record 在第一个记录标记前 40 字节 (0x28)
+            pre_offset = first_rec.marker_offset - 40
+            if pre_offset < 0:
+                continue
+            # 验证 pre-record 区域可读
+            if pre_offset + 8 > len(self.data):
+                continue
+            self.canvases.append(WSDCanvas(
+                canvas_index=canvas_idx,
+                pre_record_offset=pre_offset,
+                first_record_idx=self.records.index(first_rec)
+            ))
+
+    def _read_pre_record(self, offset: int) -> Tuple[int, int, int, int]:
+        """读取 pre-record 区域的 4 个 uint16 LE 值"""
+        f0 = struct.unpack('<H', self.data[offset:offset + 2])[0]
+        f1 = struct.unpack('<H', self.data[offset + 2:offset + 4])[0]
+        f2 = struct.unpack('<H', self.data[offset + 4:offset + 6])[0]
+        f3 = struct.unpack('<H', self.data[offset + 6:offset + 8])[0]
+        return (f0, f1, f2, f3)
+
+    def getCanvasPreRecord(self, canvas_index: int) -> Optional[Tuple[int, int, int, int]]:
+        """
+        获取画布 pre-record 的 4 个 uint16 字段值
+        
+        pre-record 格式（8字节）:
+          [0-1]: field0 (uint16 LE) - 疑似 X 位置或宽度
+          [2-3]: field1 (uint16 LE) - 疑似 layout flags
+          [4-5]: field2 (uint16 LE) - 疑似 Y 位置或高度
+          [6-7]: field3 (uint16 LE) - padding
+        
+        Args:
+            canvas_index: 画布索引
+        
+        Returns:
+            (field0, field1, field2, field3) 或 None
+        """
+        if not self._parsed:
+            self.parseRecords()
+        for cvs in self.canvases:
+            if cvs.canvas_index == canvas_index:
+                return self._read_pre_record(cvs.pre_record_offset)
+        return None
+
+    def modifyCanvasPreRecord(self, canvas_index: int,
+                               field0: Optional[int] = None,
+                               field1: Optional[int] = None,
+                               field2: Optional[int] = None,
+                               field3: Optional[int] = None) -> bool:
+        """
+        修改画布 pre-record 的指定字段
+        
+        pre-record 是 Type 0x01 记录位置的唯一控制字段（已验证）。
+        修改 pre-record 会导致该画布上所有 Type 0x01 线段和画布整体平移。
+        
+        Args:
+            canvas_index: 画布索引
+            field0: 新值（uint16），None 表示不修改
+            field1: 新值（uint16），None 表示不修改
+            field2: 新值（uint16），None 表示不修改
+            field3: 新值（uint16），None 表示不修改
+        
+        Returns:
+            成功返回 True
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        cvs = None
+        for c in self.canvases:
+            if c.canvas_index == canvas_index:
+                cvs = c
+                break
+        if cvs is None:
+            print(f"错误: 画布索引 {canvas_index} 不存在")
+            return False
+
+        offset = cvs.pre_record_offset
+        old = self._read_pre_record(offset)
+        new = list(old)
+
+        if field0 is not None:
+            new[0] = field0 & 0xFFFF
+        if field1 is not None:
+            new[1] = field1 & 0xFFFF
+        if field2 is not None:
+            new[2] = field2 & 0xFFFF
+        if field3 is not None:
+            new[3] = field3 & 0xFFFF
+
+        self.data[offset:offset + 2] = struct.pack('<H', new[0])
+        self.data[offset + 2:offset + 4] = struct.pack('<H', new[1])
+        self.data[offset + 4:offset + 6] = struct.pack('<H', new[2])
+        self.data[offset + 6:offset + 8] = struct.pack('<H', new[3])
+
+        print(f"[pre-record修改] 画布 {canvas_index}: "
+              f"{old} -> {tuple(new)} (偏移=0x{offset:x})")
+        return True
+
+    def moveCanvasBy(self, canvas_index: int, dx: int = 0, dy: int = 0,
+                     dx_field: int = 0, dy_field: int = 2) -> bool:
+        """
+        按增量平移画布位置（用于测试确定 X/Y 字段）
+        
+        Args:
+            canvas_index: 画布索引
+            dx: X方向增量（加到 dx_field 指定的字段）
+            dy: Y方向增量（加到 dy_field 指定的字段）
+            dx_field: 作为X的字段索引 (0-3)，默认0
+            dy_field: 作为Y的字段索引 (0-3)，默认2
+        
+        Returns:
+            成功返回 True
+        """
+        if not self._parsed:
+            self.parseRecords()
+
+        pre = self.getCanvasPreRecord(canvas_index)
+        if pre is None:
+            return False
+
+        new_vals = list(pre)
+        if dx_field >= 0 and dx_field < 4:
+            new_vals[dx_field] = (new_vals[dx_field] + dx) & 0xFFFF
+        if dy_field >= 0 and dy_field < 4:
+            new_vals[dy_field] = (new_vals[dy_field] + dy) & 0xFFFF
+
+        return self.modifyCanvasPreRecord(canvas_index,
+                                          field0=new_vals[0],
+                                          field1=new_vals[1],
+                                          field2=new_vals[2],
+                                          field3=new_vals[3])
 
     def _assign_canvas_indices(self):
         """

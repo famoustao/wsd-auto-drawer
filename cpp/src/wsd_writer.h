@@ -68,6 +68,15 @@ struct Record {
     size_t recordSize;     // 记录总大小
 };
 
+// 画布信息（pre-record 区域）
+// pre-record 位于画布第一条记录标记之前 40 字节处，
+// 控制该画布上 Type 0x01 记录的位置。
+struct Canvas {
+    int canvasIndex;        // 画布索引
+    size_t preRecordOffset; // pre-record 区域在文件中的绝对偏移（8字节）
+    size_t firstRecordIdx;  // 该画布的第一条记录在 records 中的索引
+};
+
 // 修改指令
 struct Modification {
     // 颜色修改: recordIndex >= 0 时有效
@@ -196,6 +205,42 @@ public:
     /// 成功返回 true
     bool modifyRecordEndpoints(int recordIndex, const std::vector<std::pair<uint32_t,uint32_t>>& newCoords);
 
+    // ============================================================
+    //  画布 pre-record 接口（Type 0x01 位置控制）
+    // ============================================================
+
+    /// 获取画布 pre-record 的 4 个 uint16 字段值
+    /// pre-record 格式（8字节）:
+    ///   [0-1]: field0 (uint16 LE) - 疑似 X 位置
+    ///   [2-3]: field1 (uint16 LE) - 疑似 layout flags
+    ///   [4-5]: field2 (uint16 LE) - 疑似 Y 位置
+    ///   [6-7]: field3 (uint16 LE) - padding
+    /// 返回 true 成功，fields 填入4个值
+    bool getCanvasPreRecord(int canvasIndex, std::array<uint16_t, 4>& fields) const;
+
+    /// 修改画布 pre-record 的指定字段
+    /// pre-record 是 Type 0x01 记录位置的唯一控制字段（已验证）
+    /// 修改会导致该画布上所有 Type 0x01 线段和画布整体平移
+    /// field0~field3: 新值（uint16），传入 nullptr 表示不修改
+    /// 成功返回 true
+    bool modifyCanvasPreRecord(int canvasIndex,
+                                const uint16_t* field0,
+                                const uint16_t* field1,
+                                const uint16_t* field2,
+                                const uint16_t* field3);
+
+    /// 按增量平移画布位置（用于测试确定 X/Y 字段）
+    /// dx: X方向增量（加到 dxField 指定的字段）
+    /// dy: Y方向增量（加到 dyField 指定的字段）
+    /// dxField: 作为X的字段索引 (0-3)，默认0
+    /// dyField: 作为Y的字段索引 (0-3)，默认2
+    /// 成功返回 true
+    bool moveCanvasBy(int canvasIndex, int dx = 0, int dy = 0,
+                       int dxField = 0, int dyField = 2);
+
+    /// 获取解析后的画布列表（只读）
+    const std::vector<Canvas>& getCanvases() const { return canvases; }
+
     /// 通过颜色名查找颜色索引字节
     /// 返回 true 找到，result 中填入4字节颜色索引
     static bool findColorByName(const std::string& colorName, std::array<uint8_t, 4>& result);
@@ -207,6 +252,12 @@ private:
     /// 分配画布索引：基于记录间距离判断画布边界
     void assignCanvasIndices();
 
+    /// 解析画布 pre-record 区域位置
+    void parseCanvasPreRecords();
+
+    /// 读取 pre-record 区域的 4 个 uint16 LE 值
+    std::array<uint16_t, 4> readPreRecord(size_t offset) const;
+
     /// 更新文件尾部校验和 (filesize_le32 + ff ff ff ff)
     void updateTailChecksum();
 
@@ -215,6 +266,7 @@ private:
 
     // 记录表修改相关数据
     std::vector<Record> records;       // 解析后的记录列表
+    std::vector<Canvas> canvases;      // 画布列表
     std::vector<uint8_t> recordData;  // 文件数据（用于修改）
     size_t originalSize = 0;           // 原始文件大小（校验用）
 };
