@@ -516,6 +516,18 @@ bool Writer::getCanvasPreRecord(int canvasIndex, std::array<uint16_t, 4>& fields
     return false;
 }
 
+bool Writer::getCanvasPosition(int canvasIndex, uint16_t& x, uint16_t& y) const {
+    std::array<uint16_t, 4> pre;
+    if (!getCanvasPreRecord(canvasIndex, pre)) return false;
+    x = pre[0];  // field0 = X
+    y = pre[2];  // field2 = Y
+    return true;
+}
+
+bool Writer::setCanvasPosition(int canvasIndex, uint16_t x, uint16_t y) {
+    return modifyCanvasPreRecord(canvasIndex, &x, nullptr, &y, nullptr);
+}
+
 bool Writer::modifyCanvasPreRecord(int canvasIndex,
                                     const uint16_t* field0,
                                     const uint16_t* field1,
@@ -551,24 +563,14 @@ bool Writer::modifyCanvasPreRecord(int canvasIndex,
     return true;
 }
 
-bool Writer::moveCanvasBy(int canvasIndex, int dx, int dy,
-                           int dxField, int dyField) {
-    std::array<uint16_t, 4> pre;
-    if (!getCanvasPreRecord(canvasIndex, pre)) return false;
+bool Writer::moveCanvasBy(int canvasIndex, int dx, int dy) {
+    uint16_t x = 0, y = 0;
+    if (!getCanvasPosition(canvasIndex, x, y)) return false;
 
-    std::array<uint16_t, 4> newVals = pre;
-    if (dxField >= 0 && dxField < 4) {
-        int val = static_cast<int>(pre[dxField]) + dx;
-        newVals[dxField] = static_cast<uint16_t>(val & 0xFFFF);
-    }
-    if (dyField >= 0 && dyField < 4) {
-        int val = static_cast<int>(pre[dyField]) + dy;
-        newVals[dyField] = static_cast<uint16_t>(val & 0xFFFF);
-    }
+    uint16_t newX = static_cast<uint16_t>((static_cast<int>(x) + dx) & 0xFFFF);
+    uint16_t newY = static_cast<uint16_t>((static_cast<int>(y) + dy) & 0xFFFF);
 
-    return modifyCanvasPreRecord(canvasIndex,
-                                  &newVals[0], &newVals[1],
-                                  &newVals[2], &newVals[3]);
+    return setCanvasPosition(canvasIndex, newX, newY);
 }
 
 void Writer::assignCanvasIndices() {

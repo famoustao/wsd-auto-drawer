@@ -794,19 +794,19 @@ class WSDRecordModifier:
 
     def getCanvasPreRecord(self, canvas_index: int) -> Optional[Tuple[int, int, int, int]]:
         """
-        获取画布 pre-record 的 4 个 uint16 字段值
+        获取画布 pre-record 的 4 个 uint16 字段值（原始字段）
         
-        pre-record 格式（8字节）:
-          [0-1]: field0 (uint16 LE) - 疑似 X 位置或宽度
-          [2-3]: field1 (uint16 LE) - 疑似 layout flags
-          [4-5]: field2 (uint16 LE) - 疑似 Y 位置或高度
-          [6-7]: field3 (uint16 LE) - padding
+        pre-record 格式（8字节，已验证）:
+          [0-1]: field0 (uint16 LE) = X 坐标（增加=向右）
+          [2-3]: field1 (uint16 LE) = layout flags
+          [4-5]: field2 (uint16 LE) = Y 坐标（增加=向下）
+          [6-7]: field3 (uint16 LE) = padding
         
         Args:
             canvas_index: 画布索引
         
         Returns:
-            (field0, field1, field2, field3) 或 None
+            (x, flags, y, padding) 或 None
         """
         if not self._parsed:
             self.parseRecords()
@@ -815,23 +815,58 @@ class WSDRecordModifier:
                 return self._read_pre_record(cvs.pre_record_offset)
         return None
 
+    def getCanvasPosition(self, canvas_index: int) -> Optional[Tuple[int, int]]:
+        """
+        获取画布位置 (X, Y)
+        
+        坐标系: X向右, Y向下。单位与原始 uint16 值一致。
+        
+        Args:
+            canvas_index: 画布索引
+        
+        Returns:
+            (x, y) 或 None
+        """
+        pre = self.getCanvasPreRecord(canvas_index)
+        if pre is None:
+            return None
+        return (pre[0], pre[2])
+
+    def setCanvasPosition(self, canvas_index: int, x: int, y: int) -> bool:
+        """
+        设置画布绝对位置 (X, Y)
+        
+        坐标系: X向右, Y向下。修改会带动画布上所有 Type 0x01 线段一起移动。
+        
+        Args:
+            canvas_index: 画布索引
+            x: X坐标（uint16）
+            y: Y坐标（uint16）
+        
+        Returns:
+            成功返回 True
+        """
+        return self.modifyCanvasPreRecord(canvas_index,
+                                          field0=x & 0xFFFF,
+                                          field2=y & 0xFFFF)
+
     def modifyCanvasPreRecord(self, canvas_index: int,
                                field0: Optional[int] = None,
                                field1: Optional[int] = None,
                                field2: Optional[int] = None,
                                field3: Optional[int] = None) -> bool:
         """
-        修改画布 pre-record 的指定字段
+        修改画布 pre-record 的指定字段（底层接口）
         
         pre-record 是 Type 0x01 记录位置的唯一控制字段（已验证）。
         修改 pre-record 会导致该画布上所有 Type 0x01 线段和画布整体平移。
         
         Args:
             canvas_index: 画布索引
-            field0: 新值（uint16），None 表示不修改
-            field1: 新值（uint16），None 表示不修改
-            field2: 新值（uint16），None 表示不修改
-            field3: 新值（uint16），None 表示不修改
+            field0: 新值（uint16），对应 X 坐标。None 表示不修改
+            field1: 新值（uint16），对应 layout flags。None 表示不修改
+            field2: 新值（uint16），对应 Y 坐标。None 表示不修改
+            field3: 新值（uint16），padding。None 表示不修改
         
         Returns:
             成功返回 True
@@ -870,17 +905,16 @@ class WSDRecordModifier:
               f"{old} -> {tuple(new)} (偏移=0x{offset:x})")
         return True
 
-    def moveCanvasBy(self, canvas_index: int, dx: int = 0, dy: int = 0,
-                     dx_field: int = 0, dy_field: int = 2) -> bool:
+    def moveCanvasBy(self, canvas_index: int, dx: int = 0, dy: int = 0) -> bool:
         """
-        按增量平移画布位置（用于测试确定 X/Y 字段）
+        按增量平移画布位置
+        
+        坐标系: X向右, Y向下。正值=右/下，负值=左/上。
         
         Args:
             canvas_index: 画布索引
-            dx: X方向增量（加到 dx_field 指定的字段）
-            dy: Y方向增量（加到 dy_field 指定的字段）
-            dx_field: 作为X的字段索引 (0-3)，默认0
-            dy_field: 作为Y的字段索引 (0-3)，默认2
+            dx: X方向增量
+            dy: Y方向增量
         
         Returns:
             成功返回 True
@@ -888,21 +922,14 @@ class WSDRecordModifier:
         if not self._parsed:
             self.parseRecords()
 
-        pre = self.getCanvasPreRecord(canvas_index)
-        if pre is None:
+        pos = self.getCanvasPosition(canvas_index)
+        if pos is None:
             return False
 
-        new_vals = list(pre)
-        if dx_field >= 0 and dx_field < 4:
-            new_vals[dx_field] = (new_vals[dx_field] + dx) & 0xFFFF
-        if dy_field >= 0 and dy_field < 4:
-            new_vals[dy_field] = (new_vals[dy_field] + dy) & 0xFFFF
+        new_x = (pos[0] + dx) & 0xFFFF
+        new_y = (pos[1] + dy) & 0xFFFF
 
-        return self.modifyCanvasPreRecord(canvas_index,
-                                          field0=new_vals[0],
-                                          field1=new_vals[1],
-                                          field2=new_vals[2],
-                                          field3=new_vals[3])
+        return self.setCanvasPosition(canvas_index, new_x, new_y)
 
     def _assign_canvas_indices(self):
         """

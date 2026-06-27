@@ -209,16 +209,26 @@ public:
     //  画布 pre-record 接口（Type 0x01 位置控制）
     // ============================================================
 
-    /// 获取画布 pre-record 的 4 个 uint16 字段值
-    /// pre-record 格式（8字节）:
-    ///   [0-1]: field0 (uint16 LE) - 疑似 X 位置
-    ///   [2-3]: field1 (uint16 LE) - 疑似 layout flags
-    ///   [4-5]: field2 (uint16 LE) - 疑似 Y 位置
-    ///   [6-7]: field3 (uint16 LE) - padding
+    /// 获取画布 pre-record 的 4 个 uint16 字段值（原始字段）
+    /// pre-record 格式（8字节，已验证）:
+    ///   [0-1]: field0 (uint16 LE) = X 坐标（增加=向右）
+    ///   [2-3]: field1 (uint16 LE) = layout flags
+    ///   [4-5]: field2 (uint16 LE) = Y 坐标（增加=向下）
+    ///   [6-7]: field3 (uint16 LE) = padding
     /// 返回 true 成功，fields 填入4个值
     bool getCanvasPreRecord(int canvasIndex, std::array<uint16_t, 4>& fields) const;
 
-    /// 修改画布 pre-record 的指定字段
+    /// 获取画布位置 (X, Y)
+    /// 坐标系: X向右, Y向下。单位与原始 uint16 值一致。
+    /// 返回 true 成功，x/y 填入坐标值
+    bool getCanvasPosition(int canvasIndex, uint16_t& x, uint16_t& y) const;
+
+    /// 设置画布绝对位置 (X, Y)
+    /// 坐标系: X向右, Y向下。修改会带动画布上所有 Type 0x01 线段一起移动。
+    /// 成功返回 true
+    bool setCanvasPosition(int canvasIndex, uint16_t x, uint16_t y);
+
+    /// 修改画布 pre-record 的指定字段（底层接口）
     /// pre-record 是 Type 0x01 记录位置的唯一控制字段（已验证）
     /// 修改会导致该画布上所有 Type 0x01 线段和画布整体平移
     /// field0~field3: 新值（uint16），传入 nullptr 表示不修改
@@ -229,14 +239,10 @@ public:
                                 const uint16_t* field2,
                                 const uint16_t* field3);
 
-    /// 按增量平移画布位置（用于测试确定 X/Y 字段）
-    /// dx: X方向增量（加到 dxField 指定的字段）
-    /// dy: Y方向增量（加到 dyField 指定的字段）
-    /// dxField: 作为X的字段索引 (0-3)，默认0
-    /// dyField: 作为Y的字段索引 (0-3)，默认2
+    /// 按增量平移画布位置
+    /// 坐标系: X向右, Y向下。正值=右/下，负值=左/上。
     /// 成功返回 true
-    bool moveCanvasBy(int canvasIndex, int dx = 0, int dy = 0,
-                       int dxField = 0, int dyField = 2);
+    bool moveCanvasBy(int canvasIndex, int dx = 0, int dy = 0);
 
     /// 获取解析后的画布列表（只读）
     const std::vector<Canvas>& getCanvases() const { return canvases; }
