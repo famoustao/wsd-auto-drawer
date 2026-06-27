@@ -716,6 +716,24 @@ class WSDRecordModifier:
                 # Type 0x01 的大小 = 77 字节
                 rec_size = self.TYPE01_SIZE
 
+            elif record_type == 0x03:
+                # Type 0x03: 贝塞尔曲线/多边形格式
+                # [32]: 0x47 结束标记
+                # [33-34]: 点数量 (uint16 LE)
+                # [35+]: 坐标数据，每点8字节
+                #   点格式: [flags(1B)] [X(uint16 LE, byte1-2)] [pad(1B)] [pad(1B)] [Y(uint24 LE, byte5-7)]
+                #   点0是特殊元数据点(含byte0=0xde等标志)，实际曲线从点1开始
+                # [35 + point_count*8 .. end]: post-record公共数据
+                if marker_pos + 36 <= file_size:
+                    point_count = struct.unpack('<H', data[marker_pos + 33:marker_pos + 35])[0]
+                    coord_regions.append((
+                        marker_pos + 35,    # 数据偏移
+                        point_count,        # 点数
+                        'bezier_point'      # 贝塞尔点格式
+                    ))
+                # Type 0x03 大小可变，根据点数确定
+                rec_size = 35 + point_count * 8 if marker_pos + 36 <= file_size else 35
+
             else:
                 # 未知类型：使用启发式方法
                 rec_size = 77  # 默认
@@ -755,7 +773,7 @@ class WSDRecordModifier:
         for idx, rec in enumerate(self.records):
             color_name = COLOR_INDEX_REVERSE.get(rec.color, f'{rec.color.hex()}')
             lw_mm = rec.line_width_raw / 400.0 if rec.line_width_raw else 0
-            type_name = {0x01: '旋转矩阵', 0x04: '直接坐标'}.get(rec.record_type, f'未知({rec.record_type:#x})')
+            type_name = {0x01: '旋转矩阵', 0x04: '直接坐标', 0x03: '贝塞尔曲线'}.get(rec.record_type, f'未知({rec.record_type:#x})')
             print(f"  记录 {idx}: 画布={rec.canvas_index}, "
                   f"偏移=0x{rec.marker_offset:x}, "
                   f"类型={type_name}, "
