@@ -62,6 +62,14 @@ PADDING_OFFSET   = 12   # 填充: marker+12，4字节 (00 00 00 00)
 LINEWIDTH_OFFSET = 16   # 线宽: marker+16，uint32 LE (毫米 * 400)
 COORD_DATA_START = 32   # 坐标数据起始: marker+32
 
+# 坐标系常量 (已验证)
+COORD_UNITS_PER_MM = 400  # 1mm = 400 单位, 1单位 = 0.0025mm = 2.5μm
+
+# 填充颜色格式: BGR (3字节), 位于填充记录 +32 + point_count*8 + 2
+# 填充记录结构: 01 ff [B] [G] [R] ff 64
+# 与边框颜色不同: 边框用4字节调色板索引, 填充用3字节BGR直接色值
+FILL_COLOR_FORMAT = 'BGR'  # 3字节: Blue, Green, Red
+
 
 class WSDTemplateParser:
     """WSD 模板文件解析器 - 提取矢量对象的坐标区域信息"""
